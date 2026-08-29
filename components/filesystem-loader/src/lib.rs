@@ -28,11 +28,8 @@ impl exports::composable::factory::loader::Guest for FilesystemLoader {
             .await
             .map_err(|e| format!("filesystem-loader: cannot open '{source}': {e}"))?;
 
-        let (mut stream, result) = file.read_via_stream(0);
-        let mut contents = Vec::new();
-        while let Some(byte) = stream.next().await {
-            contents.push(byte);
-        }
+        let (stream, result) = file.read_via_stream(0);
+        let contents = stream.collect().await;
         result
             .await
             .map_err(|e| format!("filesystem-loader: cannot read '{source}': {e}"))?;
