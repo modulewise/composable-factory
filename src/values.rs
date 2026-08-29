@@ -658,7 +658,7 @@ impl<'a> Writer<'a> {
                 let (base, offset) = self.memory_dest(slot)?;
                 self.write_memory(ty, base, offset, value)
             }
-            wit_parser::Type::Id(id) => self.build_id(id, slot, value),
+            wit_parser::Type::Id(id) => self.write_defined(id, slot, value),
             other => bail!("unsupported type {other:?}"),
         }
     }
@@ -741,7 +741,7 @@ impl<'a> Writer<'a> {
     /// Write a value of a defined type: anything a `Type::Id` can name.
     /// A `Local` carries its own declared type, so slicing a slot to a member
     /// brings the types with it and each arm bitcasts to what it finds.
-    fn build_id(&self, id: wit_parser::TypeId, slot: &Slot, value: &ValueSpec) -> Result<()> {
+    fn write_defined(&self, id: wit_parser::TypeId, slot: &Slot, value: &ValueSpec) -> Result<()> {
         match &self.ctx.resolve().types[id].kind {
             TypeDefKind::Type(inner) => self.write(*inner, slot, value),
             // A resource, future, or stream handle is a single i32; the
@@ -1196,8 +1196,8 @@ impl<'a> Writer<'a> {
     /// Store a value already on the stack into `local`, converting it if the
     /// local was declared as a different type.
     ///
-    /// `actual` is what is on the stack right now: a `u8` leaf pushed
-    /// `i32.const`, so the stack holds an i32.
+    /// `actual` is what is on the stack right now, which may not match the WIT
+    /// type, e.g. a `u8` leaf pushes `i32.const`, so the stack holds an i32.
     fn set_local(&self, local: Local, actual: ValType) -> Result<()> {
         if local.ty != actual {
             for instruction in bitcast(actual, local.ty)? {
