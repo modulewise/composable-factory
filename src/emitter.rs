@@ -15,16 +15,17 @@ pub struct Emitter {
 
 /// State to support an [`Emitter`] whose public surface is its operations.
 struct EmitterState {
-    /// The instructions provided to `wasm_encoder` upon [`Emitter::finish`].
+    /// The instructions provided to `wasm_encoder` upon [`Emitter::encode`].
     instructions: Vec<Instruction<'static>>,
-    /// The locals provided to `wasm_encoder` upon [`Emitter::finish`].
+    /// The locals provided to `wasm_encoder` upon [`Emitter::encode`].
     locals: Vec<ValType>,
     /// Index where declared locals begin, after the core params.
     first_local: u32,
-    /// Enclosing frame labels, ordered to capture depth.
+    /// Enclosing frame labels, ordered to capture depth. Pushed and popped
+    /// while emitting; empty when the body is complete.
     labels: Vec<String>,
     /// An error detected where it cannot be returned (`drop` does not return a
-    /// `Result`); surfaces in [`Emitter::finish`].
+    /// `Result`); surfaces in [`Emitter::encode`].
     deferred_error: Option<String>,
 }
 
@@ -203,8 +204,9 @@ impl Emitter {
         });
     }
 
-    /// Encode the function by applying the locals and instructions.
-    pub(crate) fn finish(&self) -> Result<EncodedFunction> {
+    /// Encode the function by applying the locals and instructions. Every
+    /// frame must be closed, so this can only be called between them.
+    pub(crate) fn encode(&self) -> Result<EncodedFunction> {
         if let Some(error) = self.with_state(|state| state.deferred_error.clone()) {
             return Err(anyhow!("{error}"));
         }
@@ -254,7 +256,7 @@ impl Drop for PendingElse {
         self.emitter.close_frame();
         // A non-Empty block type requires an else, because both arms must
         // leave a value of the same declared type. Record this error so that
-        // it can be returned from `finish`.
+        // it can be returned from `encode`.
         if !matches!(self.block_type, BlockType::Empty) {
             self.emitter.defer_error(
                 "an `if` with a non-empty block type requires an `else` arm \
@@ -288,12 +290,12 @@ mod tests {
     const EMPTY: u8 = 0x40;
 
     fn body(emitter: &Emitter) -> Vec<u8> {
-        emitter.finish().expect("finish").into_raw_body()
+        emitter.encode().expect("encode").into_raw_body()
     }
 
     fn validate(emitter: &Emitter, params: Vec<ValType>, results: Vec<ValType>) {
         use wasm_encoder::{CodeSection, FuncType, FunctionSection, Module, TypeSection};
-        let function = emitter.finish().expect("finish");
+        let function = emitter.encode().expect("encode");
         let mut types = TypeSection::new();
         types.ty().func_type(&FuncType::new(params, results));
         let mut functions = FunctionSection::new();
@@ -373,7 +375,7 @@ mod tests {
             emitter.block("done", BlockType::Empty, || anyhow::bail!("body failed"));
         assert!(result.is_err());
         assert!(
-            emitter.finish().is_ok(),
+            emitter.encode().is_ok(),
             "the frame must be closed on failure"
         );
     }
@@ -537,7 +539,7 @@ mod tests {
         let emitter = Emitter::new(0);
         emitter.emit(Instruction::I32Const(1));
         drop(emitter.if_(BlockType::Empty, || Ok(())).expect("if"));
-        assert!(emitter.finish().is_ok());
+        assert!(emitter.encode().is_ok());
     }
 
     #[test]
@@ -552,7 +554,7 @@ mod tests {
                 })
                 .expect("if"),
         );
-        let error = emitter.finish().expect_err("a missing else must fail");
+        let error = emitter.encode().expect_err("a missing else must fail");
         assert!(error.to_string().contains("`else`"));
     }
 
@@ -634,11 +636,11 @@ mod tests {
     }
 
     #[test]
-    fn an_unclosed_frame_fails_at_finish() {
+    fn an_unclosed_frame_fails_at_encode() {
         let emitter = Emitter::new(0);
         // Reaching into the state directly because no operation can leak a frame.
         emitter.with_state(|state| state.labels.push("unclosed".to_string()));
-        let error = emitter.finish().expect_err("an open frame must fail");
+        let error = emitter.encode().expect_err("an open frame must fail");
         assert!(error.to_string().contains("left open"));
     }
 
@@ -647,7 +649,7 @@ mod tests {
         let emitter = Emitter::new(0);
         emitter.defer_error("first".to_string());
         emitter.defer_error("second".to_string());
-        let error = emitter.finish().expect_err("deferred");
+        let error = emitter.encode().expect_err("deferred");
         assert!(error.to_string().contains("first"));
     }
 
