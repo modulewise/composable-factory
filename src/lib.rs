@@ -2,5 +2,6 @@
 
 mod abi;
 mod module;
+mod values;
 
 pub mod emitter;
