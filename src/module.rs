@@ -77,6 +77,7 @@ impl CoreModule {
             );
         }
 
+        // Last step, since the import and function loops above intern types.
         let mut types = TypeSection::new();
         for (params, results) in self.types.func_types() {
             types
@@ -336,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn a_mutable_global_is_declared_with_its_initial_value() {
+    fn a_mutable_global_can_be_read_and_written() {
         let mut module = empty();
         module.globals.push(CoreGlobal {
             ty: GlobalType {
