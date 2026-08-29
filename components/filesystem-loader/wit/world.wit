@@ -1,0 +1,8 @@
+package composable:filesystem-loader;
+
+world filesystem-loader {
+    import wasi:filesystem/preopens@0.3.0;
+    import wasi:filesystem/types@0.3.0;
+
+    export composable:factory/loader;
+}

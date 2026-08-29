@@ -1,0 +1,36 @@
+[package]
+name = "composable-factory"
+description = "Build Wasm Components with Wasm Components"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+categories = ["wasm"]
+keywords = ["wasm", "webassembly", "wit"]
+
+[workspace]
+members = [
+    ".",
+    "components/*",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/modulewise/composable-factory"
+
+[workspace.dependencies]
+anyhow = "1"
+wasm-encoder = "0.258"
+wit-bindgen = "0.61"
+
+[dependencies]
+anyhow.workspace = true
+indexmap = "2"
+serde_json = "1"
+wasm-encoder.workspace = true
+wasmparser = "0.258"
+wit-component = "0.258"
+wit-parser = "0.258"
