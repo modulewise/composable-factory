@@ -1,6 +1,7 @@
 //! Factory for building Wasm Components with Wasm Components.
 
 mod abi;
+mod component;
 mod module;
 mod values;
 
