@@ -1,0 +1,13 @@
+[component.intercepted]
+uri = "./lib/logging-greeter.wasm"
+imports = ["greeter", "logging-stdout"]
+
+[component.greeter]
+uri = "./lib/hello.wasm"
+
+[component.logging-stdout]
+uri = "./lib/wasi-logging-to-stdout.wasm"
+imports = ["wasip2"]
+
+[capability.wasip2]
+type = "wasi:p2"

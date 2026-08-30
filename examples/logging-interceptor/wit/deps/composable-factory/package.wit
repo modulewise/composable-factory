@@ -1,0 +1,16 @@
+package composable:factory;
+
+interface factory {
+  build: async func() -> result<list<u8>, string>;
+}
+
+interface loader {
+  load: async func(source: string) -> result<list<u8>, string>;
+}
+
+world simple-factory {
+  export factory;
+}
+world simple-loader {
+  export loader;
+}

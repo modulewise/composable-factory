@@ -1,0 +1,8 @@
+package composable:logging-interceptor-factory;
+
+world logging-interceptor-factory {
+    import wasi:config/store@0.2.0-rc.1;
+    import composable:factory/loader;
+
+    export composable:factory/factory;
+}

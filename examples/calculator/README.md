@@ -96,15 +96,22 @@ async fn build() -> Result<Vec<u8>, String> {
 The WIT contract is `build: async func() -> result<list<u8>, string>`. Everything a factory needs
 should arrive through its imports, so it takes no arguments.
 
-## Build and Run
+## Running the Example
 
 ```bash
-./build.sh  # builds factory -> lib/calculator-factory.wasm, then invokes it -> lib/calculator.wasm
-./run.sh    # calls add and multiply on the built component
+./run.sh
 ```
 
-Expect `calc.add 2 3 => 5` and `calc.multiply 6 7 => 42`.
+It builds the factory, generates the calculator component, then invokes it:
 
-`build.sh` shows the factory's full lifecycle in three commands: `cargo build` to build a core
-module for the factory itself, `wasm-tools component new` to componentize it, then
-`composable invoke` to run the factory and capture the `.wasm` component it emits to stdout.
+```
+==> Invoking the calculator:
+    calc.add 2 3       => 5
+    calc.multiply 6 7  => 42
+```
+
+`build.sh` compiles the factory itself: `cargo build` for a core module, then
+`wasm-tools component new` to componentize it.
+
+`run.sh` then uses `composable invoke` to call the
+factory's `build` export, capturing the component it emits to stdout.

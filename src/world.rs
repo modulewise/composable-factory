@@ -18,6 +18,10 @@ use crate::values::{
 
 pub use crate::values::ValueSpec;
 
+/// A variant-like type's cases in discriminant order: each name is paired with
+/// its payload type, or `None` for a payload-less case.
+type Cases = Vec<(String, Option<wit_parser::Type>)>;
+
 /// A type at some position in the component's WIT. Reached from a function's
 /// params or result, and from there by descending through [`Kind`].
 #[derive(Clone)]
@@ -129,7 +133,7 @@ impl Type {
     /// The shared decomposition behind every walk over a tagged type, so
     /// `variant`, `enum`, `option` and `result` are stated in one place rather
     /// than re-derived per walk.
-    fn variant_cases(&self) -> Result<(Vec<(String, Option<wit_parser::Type>)>, Int, usize)> {
+    fn variant_cases(&self) -> Result<(Cases, Int, usize)> {
         let resolve = self.ctx.resolve();
         // Follow aliases to the underlying definition.
         let mut wit = self.wit;
@@ -142,40 +146,39 @@ impl Type {
                 _ => break id,
             }
         };
-        let (cases, tag): (Vec<(String, Option<wit_parser::Type>)>, Int) =
-            match &resolve.types[id].kind {
-                TypeDefKind::Variant(variant) => (
-                    variant
-                        .cases
-                        .iter()
-                        .map(|case| (case.name.clone(), case.ty))
-                        .collect(),
-                    variant.tag(),
-                ),
-                TypeDefKind::Enum(declared) => (
-                    declared
-                        .cases
-                        .iter()
-                        .map(|case| (case.name.clone(), None))
-                        .collect(),
-                    declared.tag(),
-                ),
-                TypeDefKind::Option(inner) => (
-                    vec![
-                        ("none".to_string(), None),
-                        ("some".to_string(), Some(*inner)),
-                    ],
-                    Int::U8,
-                ),
-                TypeDefKind::Result(result) => (
-                    vec![
-                        ("ok".to_string(), result.ok),
-                        ("err".to_string(), result.err),
-                    ],
-                    Int::U8,
-                ),
-                other => bail!("unsupported type kind {other:?} (not variant-like)"),
-            };
+        let (cases, tag): (Cases, Int) = match &resolve.types[id].kind {
+            TypeDefKind::Variant(variant) => (
+                variant
+                    .cases
+                    .iter()
+                    .map(|case| (case.name.clone(), case.ty))
+                    .collect(),
+                variant.tag(),
+            ),
+            TypeDefKind::Enum(declared) => (
+                declared
+                    .cases
+                    .iter()
+                    .map(|case| (case.name.clone(), None))
+                    .collect(),
+                declared.tag(),
+            ),
+            TypeDefKind::Option(inner) => (
+                vec![
+                    ("none".to_string(), None),
+                    ("some".to_string(), Some(*inner)),
+                ],
+                Int::U8,
+            ),
+            TypeDefKind::Result(result) => (
+                vec![
+                    ("ok".to_string(), result.ok),
+                    ("err".to_string(), result.err),
+                ],
+                Int::U8,
+            ),
+            other => bail!("unsupported type kind {other:?} (not variant-like)"),
+        };
         let payload_offset = self
             .ctx
             .layout()

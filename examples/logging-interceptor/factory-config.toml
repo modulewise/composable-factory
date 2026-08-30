@@ -1,0 +1,16 @@
+[component.factory]
+uri = "./lib/logging-interceptor-factory.wasm"
+imports = ["loader"]
+config.target = "hello.wasm"
+
+[component.loader]
+uri = "./lib/filesystem-loader.wasm"
+imports = ["filesystem"]
+
+[capability.filesystem]
+type = "wasi:filesystem"
+
+[[capability.filesystem.preopens]]
+host = "./lib"
+guest = "/lib"
+perms = "read-only"
