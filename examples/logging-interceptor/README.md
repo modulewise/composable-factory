@@ -91,7 +91,7 @@ The same `target.exports()` selection is added to this component's world as both
 exports.
 
 `WorldSource::from_component` decodes a component's bytes into the world it implements, failing if
-the bytes are a WIT package rather than a component. `PackageSource::from_text` parses WIT source.
+the bytes are a WIT package rather than a component. `PackageSource::from_text` parses WIT as text.
 
 `wasi:logging` is an additional import used within each intercepted call.
 
