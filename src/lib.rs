@@ -6,4 +6,5 @@ mod module;
 mod values;
 
 pub mod emitter;
+pub mod wit;
 pub mod world;
