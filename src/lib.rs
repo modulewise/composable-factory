@@ -5,3 +5,4 @@ mod module;
 mod values;
 
 pub mod emitter;
+pub mod world;
