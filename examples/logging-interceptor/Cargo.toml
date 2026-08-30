@@ -1,0 +1,12 @@
+[package]
+name = "logging-interceptor-factory"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow.workspace = true
+composable-factory = { path = "../.." }
+wit-bindgen = { workspace = true, features = ["async-spawn"] }

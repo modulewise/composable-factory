@@ -1,0 +1,2 @@
+[component.calc]
+uri = "./lib/calculator.wasm"
