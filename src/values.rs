@@ -354,18 +354,14 @@ impl ValueSpec {
         let items: Vec<ValueSpec> = items.into_iter().map(Into::into).collect();
         // A list of byte literals is a `list<u8>` that can be interned, so it
         // takes the same path a `bytes` literal does.
-        if !items.is_empty()
-            && items
-                .iter()
-                .all(|item| matches!(item, ValueSpec::Leaf(Leaf::U8(_))))
-        {
-            let bytes = items
-                .iter()
-                .map(|item| match item {
-                    ValueSpec::Leaf(Leaf::U8(byte)) => *byte,
-                    _ => unreachable!("just checked every item"),
-                })
-                .collect();
+        let bytes: Option<Vec<u8>> = items
+            .iter()
+            .map(|item| match item {
+                ValueSpec::Leaf(Leaf::U8(byte)) => Some(*byte),
+                _ => None,
+            })
+            .collect();
+        if let Some(bytes) = bytes.filter(|bytes| !bytes.is_empty()) {
             return ValueSpec::Leaf(Leaf::Bytes(bytes));
         }
         ValueSpec::List(items)
@@ -2687,7 +2683,7 @@ mod tests {
 
     #[test]
     fn joining_only_literals_interns_one_string() {
-        // Nothing is left to do at runtime, so the parts collapse to a literal.
+        // Values all known at build time, so parts collapse to a literal.
         let spec = ValueSpec::concat([ValueSpec::string("hello "), ValueSpec::string("world")]);
         let ValueSpec::Leaf(Leaf::Str(text)) = spec else {
             panic!("expected a single interned literal");
@@ -2696,14 +2692,13 @@ mod tests {
     }
 
     #[test]
-    fn joining_splices_the_parts_of_a_nested_concat() {
+    fn joining_a_concat_flattens_its_parts() {
         let ctx = context(STRING_WIT);
         let inner = ValueSpec::concat([ValueSpec::string("a"), string_source(&ctx, Slot::at(0))]);
         let spec = ValueSpec::concat([inner, ValueSpec::string("b")]);
         let ValueSpec::Leaf(Leaf::Concat(parts)) = spec else {
             panic!("expected a concat");
         };
-        // Three parts, not a concat holding a concat.
         assert_eq!(parts.len(), 3);
         assert!(matches!(parts[1], ValueSpec::Leaf(Leaf::Source(_))));
     }
@@ -2726,7 +2721,7 @@ mod tests {
 
     #[test]
     fn a_literal_joined_to_a_ref_in_locals_is_allocated_and_copied() {
-        // A received param is in locals, the common case for this join.
+        // A received param is in locals, the common case for joining.
         let ctx = context(STRING_WIT);
         let ty = named_type(&ctx, "name");
         let emitter = Emitter::new(2);
@@ -2810,14 +2805,14 @@ mod tests {
     }
 
     #[test]
-    fn joining_rejects_a_part_that_is_not_a_string() {
+    fn joining_rejects_a_part_that_is_not_a_byte_sequence() {
         let ctx = context(STRING_WIT);
         let ty = named_type(&ctx, "name");
         let emitter = Emitter::new(1);
         let spec = ValueSpec::concat([ValueSpec::string("n="), ValueSpec::u32(7)]);
         let error = Writer::new(&ctx, &emitter)
             .write(ty, &Slot::at(0), &spec)
-            .expect_err("a u32 part has no string content");
+            .expect_err("a u32 part is neither a string nor a list<u8>");
         assert!(format!("{error:#}").contains("u32"), "{error:#}");
     }
 
@@ -2837,7 +2832,7 @@ mod tests {
         let spec = ValueSpec::concat([ValueSpec::string("a"), ValueSpec::source(source)]);
         let error = Writer::new(&ctx, &emitter)
             .write(ty, &Slot::at(0), &spec)
-            .expect_err("a concat is a string");
+            .expect_err("a u32 position takes neither a string nor a list<u8>");
         assert!(format!("{error:#}").contains("concat"), "{error:#}");
     }
 
@@ -2862,7 +2857,7 @@ mod tests {
         world w { import i; }";
 
     #[test]
-    fn a_list_of_byte_literals_is_interned_as_single_unit() {
+    fn a_list_of_byte_literals_is_interned_as_a_single_unit() {
         // Interned like a string, so the body stores a `{ptr, len}` pair
         // rather than a per-element byte.
         let spec = ValueSpec::list([ValueSpec::u8(1), ValueSpec::u8(2)]);
