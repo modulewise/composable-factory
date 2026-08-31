@@ -13,7 +13,7 @@ use crate::abi;
 use crate::emitter::Emitter;
 use crate::values::{
     BuildContext, Len, Load, Loader, Local, Size, Slot, ValueRef, Writer, call_allocator,
-    member_slots, reserve,
+    load_ptr_len, member_slots, reserve,
 };
 
 pub use crate::values::ValueSpec;
@@ -706,27 +706,8 @@ impl Value {
     }
 
     /// Load this value's `{ptr, len}` pair and return the locals holding them.
-    /// In memory that is two loads; flattened they are already locals.
     fn load_ptr_len(&self) -> Result<(u32, u32)> {
-        match &self.slot {
-            Slot::Memory { base, offset } => {
-                let pointer = self.local(ValType::I32);
-                let length = self.local(ValType::I32);
-                self.emit(Instruction::LocalGet(*base));
-                self.emit(Load::I32.instruction(*offset));
-                self.emit(Instruction::LocalSet(pointer));
-                self.emit(Instruction::LocalGet(*base));
-                self.emit(Load::I32.instruction(offset + 4));
-                self.emit(Instruction::LocalSet(length));
-                Ok((pointer, length))
-            }
-            Slot::Flat { locals } => {
-                let [pointer, length, ..] = locals[..] else {
-                    bail!("a list/map needs two locals (ptr, len)");
-                };
-                Ok((pointer.index, length.index))
-            }
-        }
+        load_ptr_len(&self.emitter, &self.slot)
     }
 
     /// Walk a flags bitset: test each declared flag's bit and report it within

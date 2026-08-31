@@ -18,7 +18,7 @@ use wit_parser::{Int, Resolve, TypeDefKind, WorldId};
 
 use crate::abi::{self, ImportEntry, Layout};
 use crate::emitter::Emitter;
-use crate::module::{Strings, TypeTable};
+use crate::module::{Data, TypeTable};
 
 /// Everything a function body reads or appends to, for the whole component.
 pub struct BuildContext {
@@ -35,7 +35,7 @@ pub struct BuildContext {
 /// What the bodies append to as they emit, and the module encodes at the end.
 #[derive(Default)]
 struct ModuleState {
-    strings: Strings,
+    data: Data,
     types: TypeTable,
 }
 
@@ -77,9 +77,9 @@ impl BuildContext {
     // Each interner borrows, acts, and releases; the cell is never handed out,
     // and neither takes a callback, so the borrow cannot be re-entered.
 
-    /// Intern a string into the data segment, returning where it landed.
-    pub(crate) fn intern(&self, s: &str) -> (u32, u32) {
-        self.module_state.borrow_mut().strings.intern(s)
+    /// Intern bytes into the data segment, returning where they landed.
+    pub(crate) fn intern(&self, bytes: &[u8]) -> (u32, u32) {
+        self.module_state.borrow_mut().data.intern(bytes)
     }
 
     /// Intern a func type, returning its index in the type section.
@@ -91,9 +91,9 @@ impl BuildContext {
     }
 
     /// Take what the bodies appended, once they have all finished.
-    pub(crate) fn take_module_state(&self) -> (TypeTable, Strings) {
+    pub(crate) fn take_module_state(&self) -> (TypeTable, Data) {
         let state = std::mem::take(&mut *self.module_state.borrow_mut());
-        (state.types, state.strings)
+        (state.types, state.data)
     }
 }
 
@@ -204,6 +204,8 @@ pub struct ValueRef {
 /// value that cannot fit its WIT type cannot be constructed.
 pub enum Leaf {
     Str(String),
+    /// A `list<u8>` literal, interned like a string.
+    Bytes(Vec<u8>),
     Bool(bool),
     S8(i8),
     S16(i16),
@@ -216,6 +218,9 @@ pub enum Leaf {
     F32(f32),
     F64(f64),
     Char(char),
+    /// Parts joined into one `string` or `list<u8>`, allocated and copied at
+    /// runtime.
+    Concat(Vec<ValueSpec>),
     /// Content an already-materialized value supplies, emitted as a copy.
     Source(ValueRef),
 }
@@ -248,6 +253,10 @@ impl ValueSpec {
             Some(s) => ValueSpec::some(ValueSpec::string(s)),
             None => ValueSpec::none(),
         }
+    }
+
+    pub fn bytes(bytes: impl Into<Vec<u8>>) -> ValueSpec {
+        ValueSpec::Leaf(Leaf::Bytes(bytes.into()))
     }
 
     pub fn bool(b: bool) -> ValueSpec {
@@ -342,7 +351,24 @@ impl ValueSpec {
     }
 
     pub fn list(items: impl IntoIterator<Item = impl Into<ValueSpec>>) -> ValueSpec {
-        ValueSpec::List(items.into_iter().map(Into::into).collect())
+        let items: Vec<ValueSpec> = items.into_iter().map(Into::into).collect();
+        // A list of byte literals is a `list<u8>` that can be interned, so it
+        // takes the same path a `bytes` literal does.
+        if !items.is_empty()
+            && items
+                .iter()
+                .all(|item| matches!(item, ValueSpec::Leaf(Leaf::U8(_))))
+        {
+            let bytes = items
+                .iter()
+                .map(|item| match item {
+                    ValueSpec::Leaf(Leaf::U8(byte)) => *byte,
+                    _ => unreachable!("just checked every item"),
+                })
+                .collect();
+            return ValueSpec::Leaf(Leaf::Bytes(bytes));
+        }
+        ValueSpec::List(items)
     }
 
     pub fn tuple(members: impl IntoIterator<Item = impl Into<ValueSpec>>) -> ValueSpec {
@@ -360,6 +386,40 @@ impl ValueSpec {
     /// Content an already-materialized value supplies.
     pub fn source(source: ValueRef) -> ValueSpec {
         ValueSpec::Leaf(Leaf::Source(source))
+    }
+
+    /// Parts joined into one `string` or `list<u8>`, based on the destination
+    /// type. Adjacent literals are joined here, so if all parts are literals,
+    /// they become a single interned entry.
+    pub fn concat(parts: impl IntoIterator<Item = impl Into<ValueSpec>>) -> ValueSpec {
+        let mut joined: Vec<ValueSpec> = Vec::new();
+        for part in parts {
+            let parts = match part.into() {
+                ValueSpec::Leaf(Leaf::Concat(parts)) => parts,
+                spec => vec![spec],
+            };
+            for part in parts {
+                match (joined.last_mut(), part) {
+                    (Some(ValueSpec::Leaf(Leaf::Str(text))), ValueSpec::Leaf(Leaf::Str(next))) => {
+                        text.push_str(&next)
+                    }
+                    (
+                        Some(ValueSpec::Leaf(Leaf::Bytes(bytes))),
+                        ValueSpec::Leaf(Leaf::Bytes(next)),
+                    ) => bytes.extend_from_slice(&next),
+                    (_, part) => joined.push(part),
+                }
+            }
+        }
+        if joined.len() == 1
+            && matches!(
+                joined[0],
+                ValueSpec::Leaf(Leaf::Str(_)) | ValueSpec::Leaf(Leaf::Bytes(_))
+            )
+        {
+            return joined.pop().expect("one part");
+        }
+        ValueSpec::Leaf(Leaf::Concat(joined))
     }
 }
 
@@ -684,14 +744,15 @@ impl<'a> Writer<'a> {
                 if !matches!(ty, wit_parser::Type::String) {
                     bail!("a string value cannot be written to a {ty:?} position");
                 }
-                let [pointer, length, ..] = locals[..] else {
-                    bail!("a string needs two locals (ptr, len), got {}", locals.len());
-                };
-                // Interning yields an offset and a length as numbers.
-                let (offset, len) = self.ctx.intern(text);
-                self.set_local_const(pointer, offset as i32)?;
-                self.set_local_const(length, len as i32)
+                self.write_interned_flat(text.as_bytes(), locals)
             }
+            Leaf::Bytes(bytes) => {
+                if !is_byte_sequence(self.ctx.resolve(), ty) {
+                    bail!("a list<u8> value cannot be written to a {ty:?} position");
+                }
+                self.write_interned_flat(bytes, locals)
+            }
+            Leaf::Concat(parts) => self.write_concat(ty, &Slot::flat(locals.to_vec()), parts),
             Leaf::Source(source) => self.copy_flat_from(source, locals),
             scalar => {
                 // The slot may be wider than this value: a variant's payload
@@ -723,10 +784,15 @@ impl<'a> Writer<'a> {
                 if !matches!(ty, wit_parser::Type::String) {
                     bail!("a string value cannot be written to a {ty:?} position");
                 }
-                let (interned, len) = self.ctx.intern(text);
-                self.store_const_i32(base, offset, interned as i32)?;
-                self.store_const_i32(base, offset + 4, len as i32)
+                self.write_interned_memory(text.as_bytes(), base, offset)
             }
+            Leaf::Bytes(bytes) => {
+                if !is_byte_sequence(self.ctx.resolve(), ty) {
+                    bail!("a list<u8> value cannot be written to a {ty:?} position");
+                }
+                self.write_interned_memory(bytes, base, offset)
+            }
+            Leaf::Concat(parts) => self.write_concat(ty, &Slot::Memory { base, offset }, parts),
             Leaf::Source(_) => unreachable!("a source is handled in write() before type dispatch"),
             scalar => {
                 let (push, stored) = push_scalar(scalar, ty)?;
@@ -833,6 +899,19 @@ impl<'a> Writer<'a> {
             }
             TypeDefKind::List(elem) => {
                 let elem = *elem;
+                // A `list<u8>` literal is interned as a unit (like a string)
+                // rather than iterating its elements.
+                if matches!(value, ValueSpec::Leaf(Leaf::Bytes(_) | Leaf::Concat(_))) {
+                    return match slot {
+                        Slot::Flat { locals } => {
+                            self.write_flat(wit_parser::Type::Id(id), locals, value)
+                        }
+                        _ => {
+                            let (base, offset) = self.memory_dest(slot)?;
+                            self.write_memory(wit_parser::Type::Id(id), base, offset, value)
+                        }
+                    };
+                }
                 let ValueSpec::List(items) = value else {
                     bail!("expected a List value for a list<T> type");
                 };
@@ -1010,6 +1089,150 @@ impl<'a> Writer<'a> {
             }
             other => bail!("unsupported type kind {other:?}"),
         }
+    }
+
+    /// Join string parts into one allocation and write its `{ptr, len}` pair.
+    ///
+    /// A source part's length is only known at runtime, so the total is summed
+    /// into a local and each part is copied at an incrementing offset.
+    fn write_concat(&self, ty: wit_parser::Type, slot: &Slot, parts: &[ValueSpec]) -> Result<()> {
+        if !is_byte_sequence(self.ctx.resolve(), ty) {
+            bail!(
+                "a concat value can only be written to a string or list<u8> position, not {ty:?}"
+            );
+        }
+        // A string destination must contain valid UTF-8, which constrains its
+        // parts. A `list<u8>` destination accepts any byte sequence.
+        let text_only = is_string(self.ctx.resolve(), ty);
+        for part in parts {
+            self.check_part(part, text_only)?;
+        }
+        let length = Local::new(self.emitter.local(ValType::I32), ValType::I32);
+        self.emit(Instruction::I32Const(0));
+        self.emit(Instruction::LocalSet(length.index));
+        // Each part's `{ptr, len}`, resolved once so the copy loop below reads
+        // the same locals the sum did.
+        let mut resolved = Vec::with_capacity(parts.len());
+        for part in parts {
+            let (pointer, part_len) = self.part_ptr_len(part)?;
+            self.emit(Instruction::LocalGet(length.index));
+            self.emit(Instruction::LocalGet(part_len));
+            self.emit(Instruction::I32Add);
+            self.emit(Instruction::LocalSet(length.index));
+            resolved.push((pointer, part_len));
+        }
+
+        let pointer = Local::new(self.emitter.local(ValType::I32), ValType::I32);
+        call_allocator(
+            self.ctx,
+            self.emitter,
+            Size::Strided {
+                count: length,
+                stride: 1,
+            },
+        );
+        self.emit(Instruction::LocalSet(pointer.index));
+
+        let cursor = self.emitter.local(ValType::I32);
+        self.emit(Instruction::LocalGet(pointer.index));
+        self.emit(Instruction::LocalSet(cursor));
+        for (part_ptr, part_len) in resolved {
+            self.emit(Instruction::LocalGet(cursor));
+            self.emit(Instruction::LocalGet(part_ptr));
+            self.emit(Instruction::LocalGet(part_len));
+            self.emit(Instruction::MemoryCopy {
+                src_mem: 0,
+                dst_mem: 0,
+            });
+            self.emit(Instruction::LocalGet(cursor));
+            self.emit(Instruction::LocalGet(part_len));
+            self.emit(Instruction::I32Add);
+            self.emit(Instruction::LocalSet(cursor));
+        }
+        self.write_ptr_len(slot, pointer, Len::In(length))
+    }
+
+    /// Intern `bytes` and set a `{ptr, len}` pair of locals with its location.
+    fn write_interned_flat(&self, bytes: &[u8], locals: &[Local]) -> Result<()> {
+        let [pointer, length, ..] = locals[..] else {
+            bail!(
+                "a string/list<u8> needs two locals (ptr, len), got {}",
+                locals.len()
+            );
+        };
+        let (offset, len) = self.ctx.intern(bytes);
+        self.set_local_const(pointer, offset as i32)?;
+        self.set_local_const(length, len as i32)
+    }
+
+    /// Intern `bytes` and store the `{ptr, len}` pair at `base + offset`.
+    fn write_interned_memory(&self, bytes: &[u8], base: u32, offset: usize) -> Result<()> {
+        let (interned, len) = self.ctx.intern(bytes);
+        self.store_const_i32(base, offset, interned as i32)?;
+        self.store_const_i32(base, offset + 4, len as i32)
+    }
+
+    /// Whether `part` can contribute to a concat. `text_only` indicates the
+    /// destination must contain valid UTF-8, which byte parts can satisfy only
+    /// when they are inspectable at build time (literals, not sources).
+    fn check_part(&self, part: &ValueSpec, text_only: bool) -> Result<()> {
+        let ValueSpec::Leaf(leaf) = part else {
+            bail!("a concat part must be a string or list<u8> value");
+        };
+        match leaf {
+            Leaf::Str(_) => Ok(()),
+            Leaf::Bytes(bytes) if text_only => match std::str::from_utf8(bytes) {
+                Ok(_) => Ok(()),
+                Err(error) => {
+                    bail!("a list<u8> part joining a string must be valid UTF-8: {error}")
+                }
+            },
+            Leaf::Bytes(_) => Ok(()),
+            Leaf::Source(source) => {
+                let resolve = self.ctx.resolve();
+                if !is_byte_sequence(resolve, source.ty) {
+                    bail!(
+                        "a concat part must be a string or list<u8>, got {:?}",
+                        source.ty
+                    );
+                }
+                if text_only && !is_string(resolve, source.ty) {
+                    bail!(
+                        "a {:?} value's bytes are unknown at build time, so they \
+                         cannot join a string, which must be valid UTF-8",
+                        source.ty
+                    );
+                }
+                Ok(())
+            }
+            other => bail!(
+                "a concat part must be a string or list<u8>, got a {} literal \
+                 (convert it with `format!` or an imported function)",
+                leaf_kind_name(other)
+            ),
+        }
+    }
+
+    /// One pre-checked concat part's pointer and length, as locals.
+    fn part_ptr_len(&self, part: &ValueSpec) -> Result<(u32, u32)> {
+        let interned = match part {
+            ValueSpec::Leaf(Leaf::Str(text)) => Some(self.ctx.intern(text.as_bytes())),
+            ValueSpec::Leaf(Leaf::Bytes(bytes)) => Some(self.ctx.intern(bytes)),
+            _ => None,
+        };
+        if let Some((offset, len)) = interned {
+            let pointer = self.emitter.local(ValType::I32);
+            let length = self.emitter.local(ValType::I32);
+            self.emit(Instruction::I32Const(offset as i32));
+            self.emit(Instruction::LocalSet(pointer));
+            self.emit(Instruction::I32Const(len as i32));
+            self.emit(Instruction::LocalSet(length));
+            return Ok((pointer, length));
+        }
+        let ValueSpec::Leaf(Leaf::Source(source)) = part else {
+            unreachable!("check_part accepts only literals and sources");
+        };
+        load_ptr_len(self.emitter, &source.slot)
     }
 
     /// Reserve `bytes` of heap and return the local holding the pointer.
@@ -1315,6 +1538,57 @@ pub(crate) fn member_slots(
     Ok(slots)
 }
 
+/// Whether `ty` is `string`, following aliases. A string destination
+/// constrains its parts, since the result must be valid UTF-8.
+fn is_string(resolve: &Resolve, ty: wit_parser::Type) -> bool {
+    match ty {
+        wit_parser::Type::String => true,
+        wit_parser::Type::Id(id) => match &resolve.types[id].kind {
+            TypeDefKind::Type(inner) => is_string(resolve, *inner),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Whether `ty` is `string` or `list<u8>` (the types a concat produces), both
+/// represented as `{ptr, len}` over bytes. Aliases are followed.
+fn is_byte_sequence(resolve: &Resolve, ty: wit_parser::Type) -> bool {
+    match ty {
+        wit_parser::Type::String => true,
+        wit_parser::Type::Id(id) => match &resolve.types[id].kind {
+            TypeDefKind::Type(inner) => is_byte_sequence(resolve, *inner),
+            TypeDefKind::List(elem) => matches!(elem, wit_parser::Type::U8),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// The locals holding a `{ptr, len}` pair. In memory that is two loads;
+/// flattened they are already locals.
+pub(crate) fn load_ptr_len(emitter: &Emitter, slot: &Slot) -> Result<(u32, u32)> {
+    match slot {
+        Slot::Memory { base, offset } => {
+            let pointer = emitter.local(ValType::I32);
+            let length = emitter.local(ValType::I32);
+            emitter.emit(Instruction::LocalGet(*base));
+            emitter.emit(Load::I32.instruction(*offset));
+            emitter.emit(Instruction::LocalSet(pointer));
+            emitter.emit(Instruction::LocalGet(*base));
+            emitter.emit(Load::I32.instruction(offset + 4));
+            emitter.emit(Instruction::LocalSet(length));
+            Ok((pointer, length))
+        }
+        Slot::Flat { locals } => {
+            let [pointer, length, ..] = locals[..] else {
+                bail!("a string/list/map needs two locals (ptr, len)");
+            };
+            Ok((pointer.index, length.index))
+        }
+    }
+}
+
 /// The bytes a core value occupies where flats are packed contiguously.
 /// A width that does not match the type would misalign every flat after it.
 fn flat_width(ty: ValType) -> Result<usize> {
@@ -1330,6 +1604,7 @@ fn flat_width(ty: ValType) -> Result<usize> {
 fn leaf_kind_name(leaf: &Leaf) -> &'static str {
     match leaf {
         Leaf::Str(_) => "string",
+        Leaf::Bytes(_) => "list<u8>",
         Leaf::Bool(_) => "bool",
         Leaf::S8(_) => "s8",
         Leaf::S16(_) => "s16",
@@ -1342,6 +1617,7 @@ fn leaf_kind_name(leaf: &Leaf) -> &'static str {
         Leaf::F32(_) => "f32",
         Leaf::F64(_) => "f64",
         Leaf::Char(_) => "char",
+        Leaf::Concat(_) => "concat",
         Leaf::Source(_) => "source",
     }
 }
@@ -1589,9 +1865,9 @@ mod tests {
     #[test]
     fn identical_strings_share_one_offset() {
         let ctx = context(WORLD);
-        assert_eq!(ctx.intern("hello"), (0, 5));
-        assert_eq!(ctx.intern("world"), (5, 5));
-        assert_eq!(ctx.intern("hello"), (0, 5));
+        assert_eq!(ctx.intern(b"hello"), (0, 5));
+        assert_eq!(ctx.intern(b"world"), (5, 5));
+        assert_eq!(ctx.intern(b"hello"), (0, 5));
     }
 
     #[test]
@@ -1607,21 +1883,21 @@ mod tests {
         let ctx = context(WORLD);
         // Each call must leave the cell free for the next, including from
         // inside a body that is mid-emission.
-        ctx.intern("first");
+        ctx.intern(b"first");
         ctx.func_type(&[], &[]);
-        ctx.intern("second");
-        assert_eq!(ctx.intern("first"), (0, 5));
+        ctx.intern(b"second");
+        assert_eq!(ctx.intern(b"first"), (0, 5));
     }
 
     #[test]
     fn taking_the_module_state_yields_what_was_interned() {
         let ctx = context(WORLD);
-        ctx.intern("hello");
+        ctx.intern(b"hello");
         ctx.func_type(&[ValType::I32], &[]);
         let (_, strings) = ctx.take_module_state();
         assert_eq!(strings.len(), 5);
         // The context is left empty, so interning again starts over.
-        assert_eq!(ctx.intern("hello"), (0, 5));
+        assert_eq!(ctx.intern(b"hello"), (0, 5));
         assert_eq!(ctx.func_type(&[ValType::I32], &[]), 0);
     }
 
@@ -2395,6 +2671,343 @@ mod tests {
             "table",
             &ValueSpec::map([(ValueSpec::string("a"), ValueSpec::u32(1))]),
         );
+    }
+
+    const STRING_WIT: &str = r"package test:concat;
+        interface i { type name = string; f: func(n: name); }
+        world w { import i; }";
+
+    /// A string source at the given slot, for joining with other parts.
+    fn string_source(ctx: &BuildContext, slot: Slot) -> ValueSpec {
+        ValueSpec::source(ValueRef {
+            ty: named_type(ctx, "name"),
+            slot,
+        })
+    }
+
+    #[test]
+    fn joining_only_literals_interns_one_string() {
+        // Nothing is left to do at runtime, so the parts collapse to a literal.
+        let spec = ValueSpec::concat([ValueSpec::string("hello "), ValueSpec::string("world")]);
+        let ValueSpec::Leaf(Leaf::Str(text)) = spec else {
+            panic!("expected a single interned literal");
+        };
+        assert_eq!(text, "hello world");
+    }
+
+    #[test]
+    fn joining_splices_the_parts_of_a_nested_concat() {
+        let ctx = context(STRING_WIT);
+        let inner = ValueSpec::concat([ValueSpec::string("a"), string_source(&ctx, Slot::at(0))]);
+        let spec = ValueSpec::concat([inner, ValueSpec::string("b")]);
+        let ValueSpec::Leaf(Leaf::Concat(parts)) = spec else {
+            panic!("expected a concat");
+        };
+        // Three parts, not a concat holding a concat.
+        assert_eq!(parts.len(), 3);
+        assert!(matches!(parts[1], ValueSpec::Leaf(Leaf::Source(_))));
+    }
+
+    #[test]
+    fn a_literal_joined_to_a_ref_in_memory_is_allocated_and_copied() {
+        let ctx = context(STRING_WIT);
+        let ty = named_type(&ctx, "name");
+        let emitter = Emitter::new(2);
+        let spec = ValueSpec::concat([
+            ValueSpec::string("hello "),
+            string_source(&ctx, Slot::at(1)),
+        ]);
+        Writer::new(&ctx, &emitter)
+            .write(ty, &Slot::at(0), &spec)
+            .expect("write");
+        let function = emitter.encode().expect("encode");
+        validate_with_allocator(&ctx, function, vec![ValType::I32, ValType::I32], Vec::new());
+    }
+
+    #[test]
+    fn a_literal_joined_to_a_ref_in_locals_is_allocated_and_copied() {
+        // A received param is in locals, the common case for this join.
+        let ctx = context(STRING_WIT);
+        let ty = named_type(&ctx, "name");
+        let emitter = Emitter::new(2);
+        let source = Slot::flat(vec![
+            Local::new(0, ValType::I32),
+            Local::new(1, ValType::I32),
+        ]);
+        let spec = ValueSpec::concat([ValueSpec::string("hello "), string_source(&ctx, source)]);
+        Writer::new(&ctx, &emitter)
+            .write(ty, &Slot::at(0), &spec)
+            .expect("write");
+        let function = emitter.encode().expect("encode");
+        validate_with_allocator(&ctx, function, vec![ValType::I32, ValType::I32], Vec::new());
+    }
+
+    #[test]
+    fn a_joined_string_is_written_into_locals() {
+        let ctx = context(STRING_WIT);
+        let ty = named_type(&ctx, "name");
+        let emitter = Emitter::new(2);
+        let spec = ValueSpec::concat([
+            ValueSpec::string("hello "),
+            string_source(&ctx, Slot::at(1)),
+        ]);
+        let destination = Slot::flat(vec![
+            Local::new(emitter.local(ValType::I32), ValType::I32),
+            Local::new(emitter.local(ValType::I32), ValType::I32),
+        ]);
+        Writer::new(&ctx, &emitter)
+            .write(ty, &destination, &spec)
+            .expect("write");
+        let function = emitter.encode().expect("encode");
+        validate_with_allocator(&ctx, function, vec![ValType::I32, ValType::I32], Vec::new());
+    }
+
+    #[test]
+    fn each_part_is_copied_at_an_incrementing_offset() {
+        // Three parts, so the cursor advances twice between the three copies.
+        let ctx = context(STRING_WIT);
+        let ty = named_type(&ctx, "name");
+        let emitter = Emitter::new(2);
+        let spec = ValueSpec::concat([
+            ValueSpec::string("a"),
+            string_source(&ctx, Slot::at(1)),
+            ValueSpec::string("b"),
+        ]);
+        Writer::new(&ctx, &emitter)
+            .write(ty, &Slot::at(0), &spec)
+            .expect("write");
+        let bytes = emitter.encode().expect("encode").into_raw_body();
+        // `memory.copy` is 0xFC 0x0A: one per part.
+        let copies = bytes
+            .windows(2)
+            .filter(|window| window == b"\xFC\x0A")
+            .count();
+        assert_eq!(copies, 3, "one copy per part: {bytes:02x?}");
+    }
+
+    #[test]
+    fn a_joined_string_nests_in_a_record_field() {
+        let ctx = context(
+            r"package test:concatfield;
+              interface i { record holder { greeting: string } f: func(h: holder); }
+              world w { import i; }",
+        );
+        let ty = named_type(&ctx, "holder");
+        let emitter = Emitter::new(2);
+        let source = ValueRef {
+            ty: wit_parser::Type::String,
+            slot: Slot::at(1),
+        };
+        let spec = ValueSpec::record([(
+            "greeting",
+            ValueSpec::concat([ValueSpec::string("hello "), ValueSpec::source(source)]),
+        )]);
+        Writer::new(&ctx, &emitter)
+            .write(ty, &Slot::at(0), &spec)
+            .expect("write");
+        let function = emitter.encode().expect("encode");
+        validate_with_allocator(&ctx, function, vec![ValType::I32, ValType::I32], Vec::new());
+    }
+
+    #[test]
+    fn joining_rejects_a_part_that_is_not_a_string() {
+        let ctx = context(STRING_WIT);
+        let ty = named_type(&ctx, "name");
+        let emitter = Emitter::new(1);
+        let spec = ValueSpec::concat([ValueSpec::string("n="), ValueSpec::u32(7)]);
+        let error = Writer::new(&ctx, &emitter)
+            .write(ty, &Slot::at(0), &spec)
+            .expect_err("a u32 part has no string content");
+        assert!(format!("{error:#}").contains("u32"), "{error:#}");
+    }
+
+    #[test]
+    fn a_joined_string_cannot_be_written_to_a_non_string_position() {
+        let ctx = context(
+            r"package test:concatbadpos;
+              interface i { type n = u32; f: func(x: n); }
+              world w { import i; }",
+        );
+        let ty = named_type(&ctx, "n");
+        let emitter = Emitter::new(2);
+        let source = ValueRef {
+            ty: wit_parser::Type::String,
+            slot: Slot::at(1),
+        };
+        let spec = ValueSpec::concat([ValueSpec::string("a"), ValueSpec::source(source)]);
+        let error = Writer::new(&ctx, &emitter)
+            .write(ty, &Slot::at(0), &spec)
+            .expect_err("a concat is a string");
+        assert!(format!("{error:#}").contains("concat"), "{error:#}");
+    }
+
+    #[test]
+    fn joining_nothing_writes_an_empty_string() {
+        let ctx = context(STRING_WIT);
+        let ty = named_type(&ctx, "name");
+        let emitter = Emitter::new(1);
+        Writer::new(&ctx, &emitter)
+            .write(
+                ty,
+                &Slot::at(0),
+                &ValueSpec::concat(Vec::<ValueSpec>::new()),
+            )
+            .expect("write");
+        let function = emitter.encode().expect("encode");
+        validate_with_allocator(&ctx, function, vec![ValType::I32], Vec::new());
+    }
+
+    const BYTES_WIT: &str = r"package test:concatbytes;
+        interface i { type blob = list<u8>; f: func(b: blob); }
+        world w { import i; }";
+
+    #[test]
+    fn a_list_of_byte_literals_is_interned_as_single_unit() {
+        // Interned like a string, so the body stores a `{ptr, len}` pair
+        // rather than a per-element byte.
+        let spec = ValueSpec::list([ValueSpec::u8(1), ValueSpec::u8(2)]);
+        assert!(matches!(spec, ValueSpec::Leaf(Leaf::Bytes(ref b)) if b == &[1, 2]));
+    }
+
+    #[test]
+    fn a_list_of_bytes_that_includes_any_value_ref_remains_a_list() {
+        let source = ValueSpec::source(ValueRef {
+            ty: wit_parser::Type::U8,
+            slot: Slot::at(0),
+        });
+        let spec = ValueSpec::list([ValueSpec::u8(1), source]);
+        assert!(matches!(spec, ValueSpec::List(_)));
+    }
+
+    #[test]
+    fn byte_literals_are_written_to_a_list_of_u8() {
+        writes_memory(BYTES_WIT, "blob", &ValueSpec::bytes(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn a_byte_literal_joined_with_a_ref_is_allocated_and_copied() {
+        let ctx = context(BYTES_WIT);
+        let ty = named_type(&ctx, "blob");
+        let emitter = Emitter::new(2);
+        let spec = ValueSpec::concat([
+            ValueSpec::bytes(vec![0xCA, 0xFE]),
+            ValueSpec::source(ValueRef {
+                ty,
+                slot: Slot::at(1),
+            }),
+        ]);
+        Writer::new(&ctx, &emitter)
+            .write(ty, &Slot::at(0), &spec)
+            .expect("write");
+        let function = emitter.encode().expect("encode");
+        validate_with_allocator(&ctx, function, vec![ValType::I32, ValType::I32], Vec::new());
+    }
+
+    #[test]
+    fn two_byte_value_refs_are_joined() {
+        let ctx = context(BYTES_WIT);
+        let ty = named_type(&ctx, "blob");
+        let emitter = Emitter::new(3);
+        let spec = ValueSpec::concat([
+            ValueSpec::source(ValueRef {
+                ty,
+                slot: Slot::at(1),
+            }),
+            ValueSpec::source(ValueRef {
+                ty,
+                slot: Slot::at(2),
+            }),
+        ]);
+        Writer::new(&ctx, &emitter)
+            .write(ty, &Slot::at(0), &spec)
+            .expect("write");
+        let function = emitter.encode().expect("encode");
+        validate_with_allocator(
+            &ctx,
+            function,
+            vec![ValType::I32, ValType::I32, ValType::I32],
+            Vec::new(),
+        );
+    }
+
+    #[test]
+    fn joining_only_byte_literals_interns_one_entry() {
+        let spec = ValueSpec::concat([ValueSpec::bytes(vec![1, 2]), ValueSpec::bytes(vec![3])]);
+        assert!(matches!(spec, ValueSpec::Leaf(Leaf::Bytes(ref b)) if b == &[1, 2, 3]));
+    }
+
+    #[test]
+    fn a_string_part_can_concat_with_bytes() {
+        // A string and a list<u8> are both `{ptr, len}` over bytes, so a
+        // string source contributes to a list<u8> destination.
+        let ctx = context(
+            r"package test:mixedbytes;
+              interface i { type blob = list<u8>; type name = string; f: func(b: blob); }
+              world w { import i; }",
+        );
+        let blob = named_type(&ctx, "blob");
+        let emitter = Emitter::new(2);
+        let spec = ValueSpec::concat([
+            ValueSpec::bytes(vec![1]),
+            ValueSpec::source(ValueRef {
+                ty: named_type(&ctx, "name"),
+                slot: Slot::at(1),
+            }),
+        ]);
+        Writer::new(&ctx, &emitter)
+            .write(blob, &Slot::at(0), &spec)
+            .expect("a string source is bytes");
+        let function = emitter.encode().expect("encode");
+        validate_with_allocator(&ctx, function, vec![ValType::I32, ValType::I32], Vec::new());
+    }
+
+    #[test]
+    fn a_byte_value_ref_cannot_join_a_string() {
+        // The reverse of the join above: a source's bytes might not be UTF-8.
+        let ctx = context(
+            r"package test:bytesintostring;
+              interface i { type blob = list<u8>; type name = string; f: func(n: name); }
+              world w { import i; }",
+        );
+        let name = named_type(&ctx, "name");
+        let emitter = Emitter::new(2);
+        let spec = ValueSpec::concat([
+            ValueSpec::string("hello "),
+            ValueSpec::source(ValueRef {
+                ty: named_type(&ctx, "blob"),
+                slot: Slot::at(1),
+            }),
+        ]);
+        let error = Writer::new(&ctx, &emitter)
+            .write(name, &Slot::at(0), &spec)
+            .expect_err("a string destination rejects a byte value ref");
+        assert!(format!("{error:#}").contains("UTF-8"), "{error:#}");
+    }
+
+    #[test]
+    fn a_byte_literal_that_is_not_utf8_cannot_join_a_string() {
+        let ctx = context(STRING_WIT);
+        let ty = named_type(&ctx, "name");
+        let emitter = Emitter::new(1);
+        let spec = ValueSpec::concat([ValueSpec::string("hi"), ValueSpec::bytes(vec![0xFF])]);
+        let error = Writer::new(&ctx, &emitter)
+            .write(ty, &Slot::at(0), &spec)
+            .expect_err("a string destination rejects invalid UTF-8");
+        assert!(format!("{error:#}").contains("UTF-8"), "{error:#}");
+    }
+
+    #[test]
+    fn a_byte_literal_that_is_utf8_can_join_a_string() {
+        let ctx = context(STRING_WIT);
+        let ty = named_type(&ctx, "name");
+        let emitter = Emitter::new(1);
+        let spec = ValueSpec::concat([
+            ValueSpec::string("hello "),
+            ValueSpec::bytes(b"world".to_vec()),
+        ]);
+        Writer::new(&ctx, &emitter)
+            .write(ty, &Slot::at(0), &spec)
+            .expect("valid UTF-8 bytes join a string");
     }
 
     #[test]

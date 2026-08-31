@@ -9,7 +9,7 @@ use wit_parser::{
 
 use crate::emitter::Emitter;
 use crate::module::{
-    CoreFunction, CoreGlobal, CoreImport, CoreMemory, CoreModule, Strings, TypeTable, align8,
+    CoreFunction, CoreGlobal, CoreImport, CoreMemory, CoreModule, Data, TypeTable, align8,
 };
 
 /// The heap pointer that allocations advance.
@@ -370,7 +370,7 @@ pub fn core_module(
     world: WorldId,
     generated: Vec<GeneratedFunction>,
     types: TypeTable,
-    data: Strings,
+    data: Data,
 ) -> Result<CoreModule> {
     let mut imports = Vec::new();
     for entry in import_entries(resolve, world) {
@@ -986,7 +986,7 @@ mod tests {
             w,
             generated,
             TypeTable::default(),
-            Strings::default(),
+            Data::default(),
         )
         .unwrap();
         validate(module);
@@ -1006,7 +1006,7 @@ mod tests {
             w,
             generated,
             TypeTable::default(),
-            Strings::default(),
+            Data::default(),
         ) else {
             panic!("an undeclared export must fail");
         };
@@ -1029,7 +1029,7 @@ mod tests {
             w,
             generated,
             TypeTable::default(),
-            Strings::default(),
+            Data::default(),
         )
         .unwrap();
         // The allocator is the first defined function, and takes four params.
@@ -1052,7 +1052,7 @@ mod tests {
                 body: empty_body(),
             }],
             TypeTable::default(),
-            Strings::default(),
+            Data::default(),
         )
         .unwrap();
         module.functions[0].body.clone().into_raw_body()
@@ -1124,7 +1124,7 @@ mod tests {
             w,
             generated,
             TypeTable::default(),
-            Strings::default(),
+            Data::default(),
         )
         .unwrap();
         assert_eq!(module.imports.len(), 1);
@@ -1152,7 +1152,7 @@ mod tests {
             w,
             generated,
             TypeTable::default(),
-            Strings::default(),
+            Data::default(),
         )
         .unwrap();
         let names: Vec<&str> = module
@@ -1181,7 +1181,7 @@ mod tests {
             w,
             generated,
             TypeTable::default(),
-            Strings::default(),
+            Data::default(),
         )
         .unwrap();
         let names: Vec<&str> = module
@@ -1195,8 +1195,8 @@ mod tests {
     #[test]
     fn an_assembled_module_declares_a_heap_global() {
         let (resolve, w) = world(r"package test:heap; world w { export run: func(); }");
-        let mut data = Strings::default();
-        data.intern("hello");
+        let mut data = Data::default();
+        data.intern(b"hello");
         let generated = vec![GeneratedFunction {
             interface: None,
             func: "run".to_string(),
@@ -1220,7 +1220,7 @@ mod tests {
             w,
             generated,
             TypeTable::default(),
-            Strings::default(),
+            Data::default(),
         )
         .unwrap();
         let mut core = module.encode();

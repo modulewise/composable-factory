@@ -693,6 +693,33 @@ mod tests {
     }
 
     #[test]
+    fn a_literal_joined_to_a_received_value_builds() {
+        // The joined length is only known at runtime, so the result is
+        // allocated and copied rather than interned.
+        let bytes = build(&Factory {
+            wit: r"package test:concatgreet;
+                   world target { export say-hello: func(name: string) -> string; }",
+            declare: |world, package| {
+                let target = package.world("target")?;
+                world.add_exports(target.exports())
+            },
+            body: |function, _| {
+                let name = function.params()[0].receive()?;
+                function
+                    .result()
+                    .expect("say-hello returns a string")
+                    .value()
+                    .write(&ValueSpec::concat([
+                        ValueSpec::string("hello "),
+                        ValueSpec::from(name),
+                    ]))
+            },
+        })
+        .expect("a joined string must build");
+        validate(&bytes);
+    }
+
+    #[test]
     fn a_received_value_copies_into_a_flat_record_field() {
         // A received param is a source, so writing it into a field copies its
         // flats into the field's locals rather than authoring a value.
