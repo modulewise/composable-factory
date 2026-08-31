@@ -8,7 +8,7 @@ use wit_parser::{Resolve, WorldId};
 
 use crate::abi::{self, GeneratedFunction};
 use crate::emitter::Emitter;
-use crate::module::{Strings, TypeTable};
+use crate::module::{Data, TypeTable};
 use crate::values::{BuildContext, reserve, reserve_memory};
 use crate::world::{ExportedFunction, FunctionResult, Imports, Value};
 
@@ -77,7 +77,7 @@ pub struct Built {
     resolve: Resolve,
     world: WorldId,
     types: TypeTable,
-    data: Strings,
+    data: Data,
     generated: Vec<GeneratedFunction>,
 }
 

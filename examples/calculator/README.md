@@ -24,26 +24,11 @@ call the component it produces:
 cargo install --git https://github.com/modulewise/composable-runtime --branch main --locked composable-runtime
 ```
 
-## The API
-
-A factory is a component that emits another component. You implement `ComponentBuilder`:
-
-```rust
-impl ComponentBuilder for Builder {
-    fn build_world(&self, world: &mut World) -> Result<()>;
-    fn build_function(&self, function: &ExportedFunction, imports: &Imports) -> Result<()>;
-}
-```
-
-`build_world` declares the generated component's surface.
-
-`build_function` is then called once per exported function to emit its body.
-
 ## The World
 
 ```rust
 fn build_world(&self, world: &mut World) -> Result<()> {
-    let calc = PackageSource::from_wit(CALCULATOR_WIT)?.world("calculator")?;
+    let calc = PackageSource::from_text(CALCULATOR_WIT)?.world("calculator")?;
     world.add_exports(calc.exports())
 }
 ```

@@ -15,7 +15,7 @@ pub struct CoreModule {
     pub memories: Vec<CoreMemory>,
     pub globals: Vec<CoreGlobal>,
     pub types: TypeTable,
-    pub data: Strings,
+    pub data: Data,
 }
 
 impl CoreModule {
@@ -155,29 +155,29 @@ impl TypeTable {
     }
 }
 
-/// The interned strings that become the module's data segment at address 0.
+/// The interned bytes that become the module's data segment at address 0.
 #[derive(Default)]
-pub struct Strings {
-    buf: String,
-    offsets: std::collections::HashMap<String, (u32, u32)>,
+pub struct Data {
+    buf: Vec<u8>,
+    offsets: std::collections::HashMap<Vec<u8>, (u32, u32)>,
 }
 
-impl Strings {
-    /// Intern `s` and return its `(offset, len)` within the data segment.
-    /// Identical strings share one entry.
-    pub fn intern(&mut self, s: &str) -> (u32, u32) {
-        if let Some(&entry) = self.offsets.get(s) {
+impl Data {
+    /// Intern `bytes` and return its `(offset, len)` within the data segment.
+    /// Identical entries are shared.
+    pub fn intern(&mut self, bytes: &[u8]) -> (u32, u32) {
+        if let Some(&entry) = self.offsets.get(bytes) {
             return entry;
         }
-        let entry = (self.buf.len() as u32, s.len() as u32);
-        self.buf.push_str(s);
-        self.offsets.insert(s.to_string(), entry);
+        let entry = (self.buf.len() as u32, bytes.len() as u32);
+        self.buf.extend_from_slice(bytes);
+        self.offsets.insert(bytes.to_vec(), entry);
         entry
     }
 
     /// The interned bytes in offset order.
     fn bytes(&self) -> &[u8] {
-        self.buf.as_bytes()
+        &self.buf
     }
 
     /// Whether anything has been interned.
@@ -209,7 +209,7 @@ mod tests {
             memories: Vec::new(),
             globals: Vec::new(),
             types: TypeTable::default(),
-            data: Strings::default(),
+            data: Data::default(),
         }
     }
 
@@ -312,10 +312,10 @@ mod tests {
 
     #[test]
     fn identical_strings_share_one_offset() {
-        let mut data = Strings::default();
-        assert_eq!(data.intern("hello"), (0, 5));
-        assert_eq!(data.intern("world"), (5, 5));
-        assert_eq!(data.intern("hello"), (0, 5));
+        let mut data = Data::default();
+        assert_eq!(data.intern(b"hello"), (0, 5));
+        assert_eq!(data.intern(b"world"), (5, 5));
+        assert_eq!(data.intern(b"hello"), (0, 5));
         assert_eq!(data.len(), 10);
     }
 
@@ -323,7 +323,7 @@ mod tests {
     fn interned_strings_are_the_data_segment() {
         let mut module = empty();
         module.memories.push(memory());
-        module.data.intern("hello");
+        module.data.intern(b"hello");
         let bytes = validate(module);
         assert_eq!(read_data_segments(&bytes), vec![(0u64, b"hello".to_vec())]);
     }
