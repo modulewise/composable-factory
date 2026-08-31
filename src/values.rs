@@ -1834,11 +1834,12 @@ fn bitcast(from: ValType, to: ValType) -> Result<Vec<Instruction<'static>>> {
 mod tests {
     use super::*;
 
-    // Store opcodes, for asserting the width of a written value.
+    // Opcodes, for the assertions that read an emitted body.
     const I32_STORE: u8 = 0x36;
     const I64_STORE: u8 = 0x37;
     const I32_STORE8: u8 = 0x3A;
     const I32_STORE16: u8 = 0x3B;
+    const I32_ADD: u8 = 0x6A;
 
     fn context(wit: &str) -> BuildContext {
         let mut resolve = Resolve::new();
@@ -2837,7 +2838,7 @@ mod tests {
     }
 
     #[test]
-    fn joining_nothing_writes_an_empty_string() {
+    fn joining_nothing_is_accepted() {
         let ctx = context(STRING_WIT);
         let ty = named_type(&ctx, "name");
         let emitter = Emitter::new(1);
@@ -2849,6 +2850,9 @@ mod tests {
             )
             .expect("write");
         let function = emitter.encode().expect("encode");
+        let body = function.clone().into_raw_body();
+        // Nothing to sum and no cursor to advance means the length stays 0.
+        assert!(!body.contains(&I32_ADD), "no arithmetic: {body:02x?}");
         validate_with_allocator(&ctx, function, vec![ValType::I32], Vec::new());
     }
 
@@ -3226,7 +3230,6 @@ mod tests {
             "point",
             &ValueSpec::record([("x", ValueSpec::u32(1)), ("y", ValueSpec::u64(2))]),
         );
-        const I64_STORE: u8 = 0x37;
         let x_offset = bytes
             .windows(3)
             .find(|window| window[0] == I32_STORE)
