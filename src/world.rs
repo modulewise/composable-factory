@@ -1601,6 +1601,19 @@ impl Imports {
             .ok_or_else(|| anyhow!("no imported function '{name}'"))?
     }
 
+    /// Every function the world imports directly, in declaration order. An
+    /// interface's functions are reached through [`Interface::functions`].
+    pub fn functions(&self) -> Result<Vec<ImportedFunction>> {
+        self.ctx.resolve().worlds[self.ctx.world()]
+            .imports
+            .values()
+            .filter_map(|item| match item {
+                WorldItem::Function(func) => Some(self.callable(None, func.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Pair a declared function with its core index.
     fn callable(
         &self,
@@ -3365,6 +3378,23 @@ mod tests {
         );
         let solo = imports.function("solo").unwrap();
         assert_eq!(solo.name(), "solo");
+    }
+
+    #[test]
+    fn world_level_functions_are_listed_in_declaration_order() {
+        // An interface's functions are accessed via the interface, not here.
+        let imports = imports(
+            r"package test:worldlevellist;
+              interface iface { helper: func(); }
+              world w { import iface; import alpha: func(); import beta: func(); }",
+        );
+        let listed: Vec<String> = imports
+            .functions()
+            .unwrap()
+            .iter()
+            .map(|f| f.name().to_string())
+            .collect();
+        assert_eq!(listed, vec!["alpha", "beta"]);
     }
 
     #[test]
