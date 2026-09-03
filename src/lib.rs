@@ -12,6 +12,7 @@ mod module;
 mod values;
 
 pub mod emitter;
+pub mod schema;
 pub mod wit;
 pub mod world;
 
