@@ -253,6 +253,18 @@ pub fn core_signature(
 
 /// Whether an exported function writes its result into memory.
 pub fn export_returns_indirectly(resolve: &Resolve, func: &Function) -> bool {
+    if func.kind.is_async() {
+        // For an async export, `task.return` delivers a result via its params,
+        // so the flat param limit decides whether those params are indirect.
+        return match func.result {
+            Some(ty) => match flat_types(resolve, ty) {
+                Ok(flats) => flats.len() > Resolve::MAX_FLAT_PARAMS,
+                // Exceeds even the 64-slot buffer for flats.
+                Err(_) => true,
+            },
+            None => false,
+        };
+    }
     resolve.wasm_signature(export_variant(func), func).retptr
 }
 
@@ -875,6 +887,36 @@ mod tests {
         let (_, func) = only_function(&resolve, w);
         let (.., cleanup) = export_signature(&resolve, &func);
         assert_eq!(cleanup, None);
+    }
+
+    #[test]
+    fn an_async_result_is_indirect_past_the_flat_param_limit() {
+        // For an async export, `task.return` carries its result via params,
+        // which go indirect if they exceed `MAX_FLAT_PARAMS`.
+        let (narrow, w) =
+            world(r"package test:asyncnarrow; world w { export f: async func() -> u32; }");
+        let (_, func) = only_function(&narrow, w);
+        assert!(!export_returns_indirectly(&narrow, &func), "one flat");
+
+        // Nine strings flatten to 18, past the limit of 16.
+        let (wide, w) = world(
+            r"package test:asyncwide;
+              world w {
+                record r {
+                  a: string, b: string, c: string, d: string, e: string,
+                  f: string, g: string, h: string, i: string,
+                }
+                export f: async func() -> r;
+              }",
+        );
+        let (_, func) = only_function(&wide, w);
+        assert_eq!(
+            flat_types(&wide, func.result.expect("a result"))
+                .unwrap()
+                .len(),
+            18
+        );
+        assert!(export_returns_indirectly(&wide, &func), "eighteen flats");
     }
 
     #[test]

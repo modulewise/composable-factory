@@ -346,6 +346,34 @@ mod tests {
     }
 
     #[test]
+    fn a_wide_async_result_is_delivered_through_memory() {
+        // `task.return` takes the result as parameters, so a result wider than
+        // the flat param limit collapses to one pointer and the value must be
+        // written to memory. Nine strings flatten to 18, past the limit of 16.
+        // Pushing those as flats instead would hand 18 values to a one-param
+        // `task.return`, which the encoder would reject.
+        build(
+            r"package test:e2easyncwide;
+              world w {
+                record wide {
+                  a: string, b: string, c: string, d: string, e: string,
+                  f: string, g: string, h: string, i: string,
+                }
+                export describe: async func() -> wide;
+              }",
+            |function, _| {
+                let fields = ["a", "b", "c", "d", "e", "f", "g", "h", "i"]
+                    .map(|name| (name, ValueSpec::string(name)));
+                function
+                    .result()
+                    .expect("a declared result")
+                    .value()
+                    .write(&ValueSpec::record(fields))
+            },
+        );
+    }
+
+    #[test]
     fn an_async_export_must_write_its_reserved_result() {
         let (resolve, w) =
             world(r"package test:e2easyncbare; world w { export answer: async func() -> u32; }");
