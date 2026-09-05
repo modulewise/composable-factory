@@ -18,9 +18,30 @@ use crate::values::{
 
 pub use crate::values::ValueSpec;
 
-/// A variant-like type's cases in discriminant order: each name is paired with
-/// its payload type, or `None` for a payload-less case.
-type Cases = Vec<(String, Option<wit_parser::Type>)>;
+/// One case of a variant-like WIT type. An enum's name is the whole value,
+/// where a `variant` (or option/result) case may have siblings with payloads.
+enum WitCase {
+    Enum(String),
+    Variant(String, Option<wit_parser::Type>),
+}
+
+impl WitCase {
+    fn name(&self) -> &str {
+        match self {
+            WitCase::Enum(name) | WitCase::Variant(name, _) => name,
+        }
+    }
+
+    fn payload(&self) -> Option<wit_parser::Type> {
+        match self {
+            WitCase::Enum(_) => None,
+            WitCase::Variant(_, payload) => *payload,
+        }
+    }
+}
+
+/// A variant-like WIT type's cases in discriminant order.
+type Cases = Vec<WitCase>;
 
 /// A type at some position in the component's WIT. Reached from a function's
 /// params or result, and from there by descending through [`Kind`].
@@ -151,7 +172,7 @@ impl Type {
                 variant
                     .cases
                     .iter()
-                    .map(|case| (case.name.clone(), case.ty))
+                    .map(|case| WitCase::Variant(case.name.clone(), case.ty))
                     .collect(),
                 variant.tag(),
             ),
@@ -159,30 +180,31 @@ impl Type {
                 declared
                     .cases
                     .iter()
-                    .map(|case| (case.name.clone(), None))
+                    .map(|case| WitCase::Enum(case.name.clone()))
                     .collect(),
                 declared.tag(),
             ),
             TypeDefKind::Option(inner) => (
                 vec![
-                    ("none".to_string(), None),
-                    ("some".to_string(), Some(*inner)),
+                    WitCase::Variant("none".to_string(), None),
+                    WitCase::Variant("some".to_string(), Some(*inner)),
                 ],
                 Int::U8,
             ),
             TypeDefKind::Result(result) => (
                 vec![
-                    ("ok".to_string(), result.ok),
-                    ("err".to_string(), result.err),
+                    WitCase::Variant("ok".to_string(), result.ok),
+                    WitCase::Variant("err".to_string(), result.err),
                 ],
                 Int::U8,
             ),
             other => bail!("unsupported type kind {other:?} (not variant-like)"),
         };
+        let payloads: Vec<Option<wit_parser::Type>> = cases.iter().map(WitCase::payload).collect();
         let payload_offset = self
             .ctx
             .layout()
-            .payload_offset(tag, cases.iter().map(|(_, ty)| ty.as_ref()));
+            .payload_offset(tag, payloads.iter().map(Option::as_ref));
         Ok((cases, tag, payload_offset))
     }
 }
@@ -389,8 +411,8 @@ impl Value {
             let (index, payload) = cases
                 .iter()
                 .enumerate()
-                .find(|(_, (name, _))| name == &arm.case)
-                .map(|(index, (_, ty))| (index, *ty))
+                .find(|(_, declared)| declared.name() == arm.case)
+                .map(|(index, declared)| (index, declared.payload()))
                 .ok_or_else(|| anyhow!("dispatch: no case '{}' in this value's type", arm.case))?;
             resolved.push((index, payload, arm));
         }
@@ -432,8 +454,8 @@ impl Value {
         let (index, payload) = cases
             .iter()
             .enumerate()
-            .find(|(_, (name, _))| name == case)
-            .map(|(index, (_, ty))| (index, *ty))
+            .find(|(_, declared)| declared.name() == case)
+            .map(|(index, declared)| (index, declared.payload()))
             .ok_or_else(|| anyhow!("assert_case: no case '{case}' in this value's type"))?;
         let payload = payload.ok_or_else(|| {
             anyhow!(
@@ -766,21 +788,29 @@ impl Value {
         &self,
         disc: u32,
         payload_slot: &Slot,
-        cases: &[(String, Option<wit_parser::Type>)],
+        cases: &[WitCase],
         case: usize,
         visitor: &mut dyn ReadVisitor,
     ) -> Result<()> {
-        let Some((name, payload)) = cases.get(case) else {
+        let Some(declared) = cases.get(case) else {
             return Ok(());
         };
-        let (name, payload) = (name.clone(), *payload);
+        let name = declared.name().to_string();
+        let payload = declared.payload();
+        let is_enum = matches!(declared, WitCase::Enum(_));
         let arm = |visitor: &mut dyn ReadVisitor| -> Result<()> {
-            visitor.begin_case(&name, payload.is_some())?;
-            if let Some(payload) = payload {
-                self.at_slot(self.ty.child(payload), payload_slot.clone())
-                    .read_walk(visitor)?;
+            match payload {
+                // The payload's walk sits between the brackets.
+                Some(payload) => {
+                    visitor.begin_case(&name)?;
+                    self.at_slot(self.ty.child(payload), payload_slot.clone())
+                        .read_walk(visitor)?;
+                    visitor.end_case()
+                }
+                // Nothing to bracket: the name is reported on its own.
+                None if is_enum => visitor.on_enum(&name),
+                None => visitor.on_case(&name),
             }
-            visitor.end_case()
         };
         // The last case needs no test. Every other case has been ruled out.
         if case + 1 == cases.len() {
@@ -898,7 +928,7 @@ impl Value {
     /// Every case's body is emitted, and that value selects one.
     fn write_variant(&self, visitor: &mut dyn WriteVisitor) -> Result<()> {
         let (cases, ..) = self.ty.variant_cases()?;
-        let names: Vec<&str> = cases.iter().map(|(name, _)| name.as_str()).collect();
+        let names: Vec<&str> = cases.iter().map(WitCase::name).collect();
         let case_index = visitor.case_index(&names)?;
         let disc = self.local(ValType::I32);
         case_index.push()?;
@@ -911,16 +941,15 @@ impl Value {
     /// value: the discriminant, then the payload if it carries one.
     fn write_cases(
         &self,
-        cases: &[(String, Option<wit_parser::Type>)],
+        cases: &[WitCase],
         case: usize,
         disc: u32,
         visitor: &mut dyn WriteVisitor,
     ) -> Result<()> {
         // The case name is not needed: the discriminant is written directly.
-        let Some((_, payload)) = cases.get(case) else {
+        let Some(payload) = cases.get(case).map(WitCase::payload) else {
             return Ok(());
         };
-        let payload = *payload;
         let write_case = |this: &Self, visitor: &mut dyn WriteVisitor| -> Result<()> {
             let (_, tag, payload_offset) = this.ty.variant_cases()?;
             let payload_slot = this.write_disc(tag, case as i64, payload_offset)?;
@@ -1351,12 +1380,27 @@ pub trait ReadVisitor {
         Ok(())
     }
 
-    /// Followed by one `begin_case` / `end_case` pair per declared case.
+    /// Followed by one callback per declared case: `on_enum` or `on_case`
+    /// where the case has no payload, else a `begin_case` / `end_case` pair
+    /// around the payload's callback.
     fn begin_variant(&mut self) -> Result<()> {
         Ok(())
     }
 
-    fn begin_case(&mut self, _name: &str, _has_payload: bool) -> Result<()> {
+    /// An `enum`'s case name, which is the whole value: no `enum` case has a
+    /// payload.
+    fn on_enum(&mut self, name: &str) -> Result<()> {
+        bail!("unhandled enum `{name}` (override `on_enum`)")
+    }
+
+    /// A `variant`, `option`, or `result` case with no payload. Unlike an
+    /// `enum`, its siblings may have a payload.
+    fn on_case(&mut self, name: &str) -> Result<()> {
+        bail!("unhandled case `{name}` (override `on_case`)")
+    }
+
+    /// A case whose payload callback is invoked before `end_case`.
+    fn begin_case(&mut self, _name: &str) -> Result<()> {
         Ok(())
     }
 
@@ -1373,8 +1417,8 @@ pub trait ReadVisitor {
         Ok(())
     }
 
-    fn on_flag(&mut self, _name: &str) -> Result<()> {
-        Ok(())
+    fn on_flag(&mut self, name: &str) -> Result<()> {
+        bail!("unhandled flag `{name}` (override `on_flag`)")
     }
 
     fn end_flags(&mut self) -> Result<()> {
@@ -2120,8 +2164,14 @@ mod tests {
         fn begin_variant(&mut self) -> Result<()> {
             self.note("variant<")
         }
-        fn begin_case(&mut self, name: &str, has_payload: bool) -> Result<()> {
-            self.note(format!("case:{name}{}", if has_payload { "+" } else { "" }))
+        fn on_enum(&mut self, name: &str) -> Result<()> {
+            self.note(format!("enum:{name}"))
+        }
+        fn on_case(&mut self, name: &str) -> Result<()> {
+            self.note(format!("case:{name}"))
+        }
+        fn begin_case(&mut self, name: &str) -> Result<()> {
+            self.note(format!("case:{name}+"))
         }
         fn end_variant(&mut self) -> Result<()> {
             self.note(">")
@@ -2349,14 +2399,34 @@ mod tests {
     }
 
     #[test]
-    fn an_enum_reports_its_cases_without_payloads() {
+    fn an_enum_case_and_a_payload_less_variant_case_are_distinguished() {
+        // Both have no payload, but only the variant's case has siblings that
+        // might. A visitor that treated them alike could not encode correctly,
+        // which is why the separate callbacks are defined.
+        let wit = r"package test:walkboth;
+              interface i {
+                enum color { red }
+                variant shape { circle(u32), empty }
+                f: func(c: color, s: shape);
+              }
+              world w { import i; }";
+        assert_eq!(walk(wit, "color"), ["variant<", "enum:red", ">"]);
+        assert_eq!(
+            walk(wit, "shape"),
+            ["variant<", "case:circle+", "leaf:u32", "case:empty", ">"]
+        );
+    }
+
+    #[test]
+    fn an_enum_reports_its_cases_as_enum_cases() {
+        // An enum case name is the whole value.
         let events = walk(
             r"package test:walkenum;
               interface i { enum color { red, green } f: func(c: color); }
               world w { import i; }",
             "color",
         );
-        assert_eq!(events, ["variant<", "case:red", "case:green", ">"]);
+        assert_eq!(events, ["variant<", "enum:red", "enum:green", ">"]);
     }
 
     #[test]
@@ -2550,6 +2620,10 @@ mod tests {
                 value.push()
             }
             fn on_other(&mut self, _kind: &str, _value: Value) -> Result<()> {
+                Ok(())
+            }
+            // Only the payload is under test, so the `empty` case is ignored.
+            fn on_case(&mut self, _name: &str) -> Result<()> {
                 Ok(())
             }
         }

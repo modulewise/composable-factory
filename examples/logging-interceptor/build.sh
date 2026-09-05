@@ -15,9 +15,11 @@ wasm-tools component new \
   ../../target/wasm32-unknown-unknown/release/logging_interceptor_factory.wasm \
   -o lib/logging-interceptor-factory.wasm
 
-echo "==> Building filesystem-loader..."
-( cd ../../components/filesystem-loader && ./build.sh >/dev/null )
-cp ../../components/filesystem-loader/lib/filesystem-loader.wasm lib/
+if [[ ! -f ../../components/lib/filesystem-loader.wasm ]]; then
+  echo "==> Building filesystem-loader..."
+  ( cd ../../components && ./build.sh >/dev/null )
+  cp ../../components/lib/filesystem-loader.wasm lib/
+fi
 
 if [[ ! -f lib/hello.wasm ]]; then
   wkg oci pull -o lib/hello.wasm ghcr.io/modulewise/demo/hello:0.2.0

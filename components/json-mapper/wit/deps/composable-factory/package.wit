@@ -31,10 +31,14 @@ interface serializer {
     end-object: func();
     begin-array: func();
     end-array: func();
+    /// An enum's case name, which is the whole value.
     add-enum: func(case: string);
-    /// The case bracket of a variant, option, result, or enum. The caller
-    /// emits one branch per case and calls this inside the branch.
-    begin-case: func(case: string, has-payload: bool);
+    /// A variant, option, or result case with no payload, whose siblings
+    /// might have one. The caller emits one branch per case and calls this
+    /// inside the branch.
+    add-case: func(case: string);
+    /// The bracket around a case's payload, whose add-* calls follow.
+    begin-case: func(case: string);
     end-case: func();
     begin-flags: func();
     add-flag: func(name: string);
