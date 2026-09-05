@@ -15,10 +15,10 @@ for project in $PROJECTS; do
 
   cargo_name=$(echo "$project" | tr '-' '_')
   core_wasm="target/${target}/release/${cargo_name}.wasm"
-  component="lib/${project}.wasm"
-  wasm-tools component new "$core_wasm" -o "$component"
+  component_wasm="lib/${project}.wasm"
+  wasm-tools component new "$core_wasm" -o "$component_wasm"
 
-  echo -e "\nBuilt $component with WIT:"
-  wasm-tools component wit lib/${project}.wasm | grep -E 'world|import|export' | sed 's/^/  /'
+  echo -e "\nBuilt $component_wasm with WIT:"
+  wasm-tools component wit "$component_wasm" | grep -E 'world|import|export' | sed 's/^/  /'
   echo -e "  }"
 done
