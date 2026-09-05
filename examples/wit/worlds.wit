@@ -1,4 +1,8 @@
-package composable:logging-interceptor-factory;
+package composable-factory:examples;
+
+world simple-factory {
+    export composable:factory/factory;
+}
 
 world logging-interceptor-factory {
     import wasi:config/store@0.2.0-rc.1;

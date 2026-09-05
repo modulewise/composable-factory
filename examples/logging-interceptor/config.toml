@@ -1,4 +1,15 @@
-[component.factory]
+[component.intercepted]
+uri = "factory:logging-greeter-factory"
+imports = ["greeter", "logger"]
+
+[component.greeter]
+uri = "./lib/hello.wasm"
+
+[component.logger]
+uri = "./lib/wasi-logging-to-stdout.wasm"
+imports = ["wasip2"]
+
+[component.logging-greeter-factory]
 uri = "./lib/logging-interceptor-factory.wasm"
 imports = ["loader"]
 config.target = "hello.wasm"
@@ -14,3 +25,6 @@ type = "wasi:filesystem"
 host = "./lib"
 guest = "/lib"
 perms = "read-only"
+
+[capability.wasip2]
+type = "wasi:p2"

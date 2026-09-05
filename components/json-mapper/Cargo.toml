@@ -1,5 +1,5 @@
 [package]
-name = "helloworld-factory"
+name = "json-mapper"
 version = "0.1.0"
 edition = "2024"
 
@@ -7,6 +7,5 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-anyhow.workspace = true
-composable-factory.workspace = true
+serde_json.workspace = true
 wit-bindgen.workspace = true

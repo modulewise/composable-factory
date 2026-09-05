@@ -8,6 +8,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 anyhow.workspace = true
-composable-factory = { path = "../.." }
+composable-factory.workspace = true
 wasm-encoder.workspace = true
-wit-bindgen = { workspace = true, features = ["async-spawn"] }
+wit-bindgen.workspace = true

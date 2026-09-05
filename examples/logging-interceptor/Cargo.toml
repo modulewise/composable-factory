@@ -8,5 +8,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 anyhow.workspace = true
-composable-factory = { path = "../.." }
-wit-bindgen = { workspace = true, features = ["async-spawn"] }
+composable-factory.workspace = true
+wit-bindgen.workspace = true

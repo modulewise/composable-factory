@@ -1,7 +1,0 @@
-world simple-factory {
-    export factory;
-}
-
-world simple-loader {
-    export loader;
-}

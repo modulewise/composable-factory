@@ -40,7 +40,7 @@ impl ComponentBuilder for Builder {
 }
 
 wit_bindgen::generate!({
-    path: "../../wit",
+    path: "../wit",
     world: "simple-factory",
 });
 
