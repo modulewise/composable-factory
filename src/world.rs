@@ -612,7 +612,7 @@ impl Value {
                 // A map flattens to `{ptr, len}` like a list, with each entry
                 // laid out as a 2-member record. The entry has no type of its
                 // own to descend into, so the key and value are walked directly.
-                visitor.begin_map()?;
+                visitor.begin_map(MapKey::try_from(&key.kind())?, &value)?;
                 self.read_entries([key, value], visitor)?;
                 visitor.end_map()?;
             }
@@ -689,8 +689,9 @@ impl Value {
     }
 
     /// The element loop for a `map<K,V>`, whose entries are `(K, V)` pairs
-    /// laid out like a two-field tuple. Each entry brackets as a tuple, so a
-    /// visitor sees the key and value as tuple elements.
+    /// laid out like a two-field tuple. Each entry has its own bracket, so a
+    /// visitor can tell an entry from a tuple, and the key and value are
+    /// bracketed within it so they can be handled in context.
     fn read_entries(&self, pair: [Type; 2], visitor: &mut dyn ReadVisitor) -> Result<()> {
         let types = [pair[0].wit(), pair[1].wit()];
         let offsets = self.ty.ctx.layout().field_offsets(types.iter());
@@ -712,12 +713,17 @@ impl Value {
                 self.emit(Instruction::I32Mul);
                 self.emit(Instruction::I32Add);
                 self.emit(Instruction::LocalSet(entry));
-                visitor.begin_tuple()?;
-                for (ty, offset) in pair.iter().zip(&offsets) {
-                    self.at_base(ty.clone(), entry, *offset)
-                        .read_walk(visitor)?;
-                }
-                visitor.end_tuple()?;
+                let [key, value] = &pair;
+                visitor.begin_entry()?;
+                visitor.begin_key()?;
+                self.at_base(key.clone(), entry, offsets[0])
+                    .read_walk(visitor)?;
+                visitor.end_key()?;
+                visitor.begin_value()?;
+                self.at_base(value.clone(), entry, offsets[1])
+                    .read_walk(visitor)?;
+                visitor.end_value()?;
+                visitor.end_entry()?;
                 self.emit(Instruction::LocalGet(index));
                 self.emit(Instruction::I32Const(1));
                 self.emit(Instruction::I32Add);
@@ -870,11 +876,14 @@ impl Value {
                 Ok(())
             }
             kind if kind.is_variant_like() => self.write_variant(visitor),
-            Kind::List(elem) => self.write_elements(&[elem.wit()], visitor),
+            Kind::List(elem) => self.write_sequence(&[elem.wit()], Bracket::Element, visitor),
             Kind::Map(key, value) => {
                 // A map flattens to `{ptr, len}` like a list, so each entry is
-                // laid out as a 2-member record. The element loop is shared.
-                self.write_elements(&[key.wit(), value.wit()], visitor)
+                // laid out as a 2-member record and the same loop builds it.
+                // Only the per-item bracket differs.
+                visitor.begin_map(MapKey::try_from(&key.kind())?, &value)?;
+                self.write_sequence(&[key.wit(), value.wit()], Bracket::Entry, visitor)?;
+                visitor.end_map()
             }
             Kind::Flags(declared) => {
                 // Which flags are set is one decision, so the visitor answers
@@ -973,17 +982,19 @@ impl Value {
             .else_(|| self.write_cases(cases, case + 1, disc, visitor))
     }
 
-    /// Build a list or map: ask the visitor how many elements there are,
-    /// allocate room for them, then emit a loop that builds one entry per
-    /// iteration. Finally write the `{ptr, len}` pair into this value.
+    /// Build a list or map: ask the visitor how many items there are, allocate
+    /// room for them, then emit a loop that builds one per iteration. Finally
+    /// write the `{ptr, len}` pair into this value.
     ///
-    /// `members` is the entry's shape: one type for a list, two for a map.
+    /// `members` is the item's shape: one type for a list, two for a map.
+    /// `bracket` is which pair of callbacks surrounds each item.
     ///
     /// This is the one place the write walk allocates, since a sequence's
-    /// elements live in their own heap block.
-    fn write_elements(
+    /// items live in their own heap block.
+    fn write_sequence(
         &self,
         members: &[wit_parser::Type],
+        bracket: Bracket,
         visitor: &mut dyn WriteVisitor,
     ) -> Result<()> {
         let layout = self.ty.ctx.layout();
@@ -1030,12 +1041,31 @@ impl Value {
                     Slot::flat(vec![Local::new(index, ValType::I32)]),
                     self.emitter.clone(),
                 );
-                visitor.begin_element(&position)?;
-                for (ty, offset) in members.iter().zip(&offsets) {
-                    self.at_base(self.ty.child(*ty), entry, *offset)
-                        .write_walk(visitor)?;
+                match bracket {
+                    Bracket::Element => {
+                        visitor.begin_element(&position)?;
+                        for (ty, offset) in members.iter().zip(&offsets) {
+                            self.at_base(self.ty.child(*ty), entry, *offset)
+                                .write_walk(visitor)?;
+                        }
+                        visitor.end_element()?;
+                    }
+                    Bracket::Entry => {
+                        // A map entry's members are its key and value, each
+                        // bracketed so the visitor can position itself for one
+                        // before it is asked to supply the other.
+                        visitor.begin_entry(&position)?;
+                        visitor.begin_key()?;
+                        self.at_base(self.ty.child(members[0]), entry, offsets[0])
+                            .write_walk(visitor)?;
+                        visitor.end_key()?;
+                        visitor.begin_value()?;
+                        self.at_base(self.ty.child(members[1]), entry, offsets[1])
+                            .write_walk(visitor)?;
+                        visitor.end_value()?;
+                        visitor.end_entry()?;
+                    }
                 }
-                visitor.end_element()?;
                 self.emit(Instruction::LocalGet(index));
                 self.emit(Instruction::I32Const(1));
                 self.emit(Instruction::I32Add);
@@ -1050,6 +1080,74 @@ impl Value {
             Local::new(pointer, ValType::I32),
             Len::In(Local::new(length, ValType::I32)),
         )
+    }
+}
+
+/// Which pair of [`WriteVisitor`] callbacks surrounds one item of a sequence.
+/// A list's items are positional elements; a map's are key-value entries.
+#[derive(Clone, Copy)]
+enum Bracket {
+    Element,
+    Entry,
+}
+
+/// The type of a `map`'s keys. WIT admits only these: a key is always one
+/// primitive, never a composite, so a visitor reading or writing a key sees
+/// exactly one leaf callback.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MapKey {
+    Bool,
+    U8,
+    U16,
+    U32,
+    U64,
+    S8,
+    S16,
+    S32,
+    S64,
+    Char,
+    String,
+}
+
+impl MapKey {
+    /// This key type's WIT name.
+    pub fn name(&self) -> &'static str {
+        match self {
+            MapKey::Bool => "bool",
+            MapKey::U8 => "u8",
+            MapKey::U16 => "u16",
+            MapKey::U32 => "u32",
+            MapKey::U64 => "u64",
+            MapKey::S8 => "s8",
+            MapKey::S16 => "s16",
+            MapKey::S32 => "s32",
+            MapKey::S64 => "s64",
+            MapKey::Char => "char",
+            MapKey::String => "string",
+        }
+    }
+}
+
+impl TryFrom<&Kind> for MapKey {
+    type Error = anyhow::Error;
+
+    /// WIT rejects any other key while parsing, so a walk reaching one means
+    /// the map was built by something other than the parser.
+    fn try_from(kind: &Kind) -> Result<Self> {
+        Ok(match kind {
+            Kind::Bool => MapKey::Bool,
+            Kind::U8 => MapKey::U8,
+            Kind::U16 => MapKey::U16,
+            Kind::U32 => MapKey::U32,
+            Kind::U64 => MapKey::U64,
+            Kind::S8 => MapKey::S8,
+            Kind::S16 => MapKey::S16,
+            Kind::S32 => MapKey::S32,
+            Kind::S64 => MapKey::S64,
+            Kind::Char => MapKey::Char,
+            Kind::String => MapKey::String,
+            other => bail!("`{}` is not a valid map key type", other.name()),
+        })
     }
 }
 
@@ -1425,11 +1523,42 @@ pub trait ReadVisitor {
         Ok(())
     }
 
-    fn begin_map(&mut self) -> Result<()> {
+    /// A `map<K, V>`, bracketing its entries. An empty map fires no entry
+    /// callbacks, so this is the only chance to see its shape.
+    fn begin_map(&mut self, _key: MapKey, _value: &Type) -> Result<()> {
         Ok(())
     }
 
     fn end_map(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// One entry of a map, bracketing its key and then its value.
+    fn begin_entry(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// The entry's key, whose callbacks follow. A map key is always one
+    /// primitive, so exactly one leaf callback comes before `end_key`.
+    fn begin_key(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn end_key(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// The entry's value, whose callbacks follow. Unlike a key, it may be
+    /// any type, so it may descend arbitrarily.
+    fn begin_value(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn end_value(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn end_entry(&mut self) -> Result<()> {
         Ok(())
     }
 }
@@ -1522,6 +1651,48 @@ pub trait WriteVisitor {
     }
 
     fn end_element(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// A `map<K, V>`, bracketing its entries. An empty map fires no entry
+    /// callbacks, so this is the only chance to see its shape.
+    fn begin_map(&mut self, _key: MapKey, _value: &Type) -> Result<()> {
+        Ok(())
+    }
+
+    fn end_map(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// One entry of a map, bracketing its key and then its value. `index`
+    /// specifies which entry, since only the visitor knows the keys and must
+    /// supply them in order. The index is the loop counter, so it is only
+    /// valid within this call and the entry's own callbacks.
+    fn begin_entry(&mut self, _index: &Value) -> Result<()> {
+        Ok(())
+    }
+
+    /// The entry's key is asked for next. A map key is always one primitive,
+    /// so exactly one leaf is requested before `end_key`.
+    fn begin_key(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn end_key(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// The entry's value is asked for next. Unlike a key, it may be any type,
+    /// so it may descend arbitrarily.
+    fn begin_value(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn end_value(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn end_entry(&mut self) -> Result<()> {
         Ok(())
     }
 
@@ -2185,11 +2356,24 @@ mod tests {
         fn end_flags(&mut self) -> Result<()> {
             self.note("}")
         }
-        fn begin_map(&mut self) -> Result<()> {
-            self.note("map{")
+        fn begin_map(&mut self, key: MapKey, _value: &Type) -> Result<()> {
+            // The key type is recorded because a visitor may branch on it.
+            self.note(format!("map<{}>{{", key.name()))
         }
         fn end_map(&mut self) -> Result<()> {
             self.note("}")
+        }
+        fn begin_entry(&mut self) -> Result<()> {
+            self.note("entry(")
+        }
+        fn begin_key(&mut self) -> Result<()> {
+            self.note("key:")
+        }
+        fn begin_value(&mut self) -> Result<()> {
+            self.note("value:")
+        }
+        fn end_entry(&mut self) -> Result<()> {
+            self.note(")")
         }
     }
 
@@ -2336,7 +2520,9 @@ mod tests {
     }
 
     #[test]
-    fn a_map_reports_each_entry_as_a_tuple() {
+    fn a_map_reports_its_key_type_and_brackets_each_entry() {
+        // The key type is reported by `begin_map` so that a visitor can decide
+        // how to handle the entries based on that key type.
         let events = walk(
             r"package test:walkmap;
               interface i { type table = map<string, u32>; f: func(t: table); }
@@ -2345,7 +2531,16 @@ mod tests {
         );
         assert_eq!(
             events,
-            ["map{", "tuple(", "leaf:string", "leaf:u32", ")", "}"]
+            [
+                "map<string>{",
+                "entry(",
+                "key:",
+                "leaf:string",
+                "value:",
+                "leaf:u32",
+                ")",
+                "}"
+            ]
         );
     }
 
@@ -2718,6 +2913,26 @@ mod tests {
             self.note("element");
             Ok(())
         }
+        fn begin_map(&mut self, key: MapKey, _value: &Type) -> Result<()> {
+            self.note(format!("map<{}>{{", key.name()));
+            Ok(())
+        }
+        fn end_map(&mut self) -> Result<()> {
+            self.note("}");
+            Ok(())
+        }
+        fn begin_entry(&mut self, _index: &Value) -> Result<()> {
+            self.note("entry");
+            Ok(())
+        }
+        fn begin_key(&mut self) -> Result<()> {
+            self.note("key:");
+            Ok(())
+        }
+        fn begin_value(&mut self) -> Result<()> {
+            self.note("value:");
+            Ok(())
+        }
         fn begin_payload(&mut self) -> Result<()> {
             self.note("payload");
             Ok(())
@@ -3035,13 +3250,27 @@ mod tests {
 
     #[test]
     fn a_map_asks_for_both_members_of_each_entry() {
+        // `begin_map` reports the key type before `length`, so a visitor knows
+        // the shape even if the map is empty.
         let events = build(
             r"package test:buildmap;
               interface i { type table = map<string, u32>; f: func(t: table); }
               world w { import i; }",
             "table",
         );
-        assert_eq!(events, ["length?", "element", "leaf:string", "leaf:u32"]);
+        assert_eq!(
+            events,
+            [
+                "map<string>{",
+                "length?",
+                "entry",
+                "key:",
+                "leaf:string",
+                "value:",
+                "leaf:u32",
+                "}"
+            ]
+        );
     }
 
     #[test]
@@ -3688,5 +3917,60 @@ mod tests {
         for name in ["r", "lst"] {
             assert!(!named_type(wit, name).kind().is_variant_like(), "{name}");
         }
+    }
+
+    #[test]
+    fn every_legal_map_key_converts_and_keeps_its_wit_name() {
+        let wit = r"package test:mapkeys;
+            interface i {
+              type kb = map<bool, u32>;
+              type kc = map<char, u32>;
+              type ks = map<string, u32>;
+              type ku8 = map<u8, u32>;
+              type ku16 = map<u16, u32>;
+              type ku32 = map<u32, u32>;
+              type ku64 = map<u64, u32>;
+              type ks8 = map<s8, u32>;
+              type ks16 = map<s16, u32>;
+              type ks32 = map<s32, u32>;
+              type ks64 = map<s64, u32>;
+              f: func(a: u32);
+            }
+            world w { import i; }";
+        for (name, expected) in [
+            ("kb", "bool"),
+            ("kc", "char"),
+            ("ks", "string"),
+            ("ku8", "u8"),
+            ("ku16", "u16"),
+            ("ku32", "u32"),
+            ("ku64", "u64"),
+            ("ks8", "s8"),
+            ("ks16", "s16"),
+            ("ks32", "s32"),
+            ("ks64", "s64"),
+        ] {
+            let Kind::Map(key, _) = named_type(wit, name).kind() else {
+                panic!("{name} is a map");
+            };
+            let key = MapKey::try_from(&key.kind()).expect("a legal key converts");
+            assert_eq!(key.name(), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_composite_is_not_a_map_key() {
+        // A composite map key would be invalid WIT, rejected by the parser.
+        let ty = named_type(
+            r"package test:nonkey;
+              interface i { record r { a: u32 } f: func(a: u32); }
+              world w { import i; }",
+            "r",
+        );
+        let error = MapKey::try_from(&ty.kind()).expect_err("a record is not a key");
+        assert!(
+            error.to_string().contains("record"),
+            "the rejected kind is named: {error}"
+        );
     }
 }

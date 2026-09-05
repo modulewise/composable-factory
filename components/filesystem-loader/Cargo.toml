@@ -1,7 +1,11 @@
 [package]
 name = "filesystem-loader"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+license.workspace = true
+description = "Filesystem loader component implementing the composable:factory/loader interface"
+homepage = "https://github.com/modulewise/composable-factory/tree/main/components/filesystem-loader"
+repository.workspace = true
 
 [lib]
 crate-type = ["cdylib"]

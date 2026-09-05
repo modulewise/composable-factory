@@ -1,7 +1,11 @@
 [package]
 name = "json-mapper"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+license.workspace = true
+description = "JSON mapper component implementing the composable:factory serializer and deserializer interfaces"
+homepage = "https://github.com/modulewise/composable-factory/tree/main/components/json-mapper"
+repository.workspace = true
 
 [lib]
 crate-type = ["cdylib"]

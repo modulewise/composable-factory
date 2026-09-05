@@ -52,29 +52,40 @@ impl GuestDeserializer for Deserializer {
         }
     }
 
+    // A string-keyed map arrives as an object, every other sequence as an
+    // array. Both are counted and indexed here.
     fn length(&self) -> u32 {
-        self.stack
-            .borrow()
-            .last()
-            .and_then(|v| v.as_array())
-            .map(|a| a.len() as u32)
-            .unwrap_or(0)
+        match self.stack.borrow().last() {
+            Some(serde_json::Value::Array(a)) => a.len() as u32,
+            Some(serde_json::Value::Object(o)) => o.len() as u32,
+            _ => 0,
+        }
     }
 
     fn enter_element(&self, index: u32) -> bool {
-        let child = self
-            .stack
-            .borrow()
-            .last()
-            .and_then(|v| v.as_array())
-            .and_then(|a| a.get(index as usize))
-            .cloned();
+        let child = match self.stack.borrow().last() {
+            Some(serde_json::Value::Array(a)) => a.get(index as usize).cloned(),
+            // An object's values are retrieved by index, its keys by `key-at`.
+            Some(serde_json::Value::Object(o)) => o.values().nth(index as usize).cloned(),
+            _ => None,
+        };
         match child {
             Some(v) => {
                 self.stack.borrow_mut().push(v);
                 true
             }
             None => false,
+        }
+    }
+
+    fn key_at(&self, index: u32) -> String {
+        // `keys` and `values` iterate one map in the same order, so the nth
+        // key pairs with the nth value `enter-element` returns.
+        match self.stack.borrow().last() {
+            Some(serde_json::Value::Object(o)) => {
+                o.keys().nth(index as usize).cloned().unwrap_or_default()
+            }
+            _ => String::new(),
         }
     }
 

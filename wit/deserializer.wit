@@ -6,11 +6,16 @@ interface deserializer {
         // Descend into object field `name`. False if absent.
         enter-field: func(name: string) -> bool;
 
-        // The number of elements in the array (or tuple/map) at the cursor.
+        // The number of items in the collection at the cursor.
         length: func() -> u32;
 
-        // Descend into element `index` of the array. False if out of range.
+        // Descend into element `index` of the array, or into the value of the
+        // object's `index`th entry. False if out of range.
         enter-element: func(index: u32) -> bool;
+
+        // The key of the object's `index`th entry, for a map whose keys the
+        // caller must supply one at a time. Empty if out of range.
+        key-at: func(index: u32) -> string;
 
         // Index of the active case within `names`, or none if it's not listed.
         case-index: func(names: list<string>) -> option<u32>;
