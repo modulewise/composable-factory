@@ -26,7 +26,7 @@ interface deserializer {
 
         // Pull the value at the current cursor as a primitive leaf.
         // Width-specific getters return values matching the target param's
-        // WIT width, so the tool passes types that match the param ABI.
+        // WIT width.
         get-string: func() -> string;
         get-char: func() -> char;
         get-bool: func() -> bool;

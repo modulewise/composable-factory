@@ -15,7 +15,7 @@ wasm-tools component new \
   ../../target/wasm32-unknown-unknown/release/logging_interceptor_factory.wasm \
   -o lib/logging-interceptor-factory.wasm
 
-if [[ ! -f ../../components/lib/filesystem-loader.wasm ]]; then
+if [[ ! -f lib/filesystem-loader.wasm ]]; then
   echo "==> Building filesystem-loader..."
   ( cd ../../components && ./build.sh >/dev/null )
   cp ../../components/lib/filesystem-loader.wasm lib/

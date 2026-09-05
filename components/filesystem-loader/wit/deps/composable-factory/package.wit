@@ -1,5 +1,42 @@
 package composable:factory;
 
+interface deserializer {
+  resource deserializer {
+    /// Parse the input JSON (an object keyed by param name).
+    constructor(input: string);
+    /// Descend into object field `name`. False if absent.
+    enter-field: func(name: string) -> bool;
+    /// The number of elements in the array (or tuple/map) at the cursor.
+    length: func() -> u32;
+    /// Descend into element `index` of the array. False if out of range.
+    enter-element: func(index: u32) -> bool;
+    /// Index of the active case within `names`, or none if it's not listed.
+    case-index: func(names: list<string>) -> option<u32>;
+    /// Descend into the active case's payload. False for a unit case.
+    enter-payload: func() -> bool;
+    /// The flag names set at the cursor.
+    %flags: func() -> list<string>;
+    /// Ascend to the parent. Exactly one per successful `enter-*`.
+    exit: func();
+    /// Pull the value at the current cursor as a primitive leaf.
+    /// Width-specific getters return values matching the target param's
+    /// WIT width.
+    get-string: func() -> string;
+    get-char: func() -> char;
+    get-bool: func() -> bool;
+    get-s8: func() -> s8;
+    get-s16: func() -> s16;
+    get-s32: func() -> s32;
+    get-s64: func() -> s64;
+    get-u8: func() -> u8;
+    get-u16: func() -> u16;
+    get-u32: func() -> u32;
+    get-u64: func() -> u64;
+    get-f32: func() -> f32;
+    get-f64: func() -> f64;
+  }
+}
+
 interface factory {
   build: async func() -> result<list<u8>, string>;
 }
@@ -31,10 +68,14 @@ interface serializer {
     end-object: func();
     begin-array: func();
     end-array: func();
+    /// An enum's case name, which is the whole value.
     add-enum: func(case: string);
-    /// The case bracket of a variant, option, result, or enum. The caller
-    /// emits one branch per case and calls this inside the branch.
-    begin-case: func(case: string, has-payload: bool);
+    /// A variant, option, or result case with no payload, whose siblings
+    /// might have one. The caller emits one branch per case and calls this
+    /// inside the branch.
+    add-case: func(case: string);
+    /// The bracket around a case's payload, whose add-* calls follow.
+    begin-case: func(case: string);
     end-case: func();
     begin-flags: func();
     add-flag: func(name: string);
@@ -44,43 +85,3 @@ interface serializer {
   }
 }
 
-interface deserializer {
-  resource deserializer {
-    /// Parse the input JSON (an object keyed by param name).
-    constructor(input: string);
-    /// Descend into object field `name`. False if absent.
-    enter-field: func(name: string) -> bool;
-    /// The number of elements in the array (or tuple/map) at the cursor.
-    length: func() -> u32;
-    /// Descend into element `index` of the array. False if out of range.
-    enter-element: func(index: u32) -> bool;
-    /// Index of the active case within `names`, or none if it's not listed.
-    case-index: func(names: list<string>) -> option<u32>;
-    /// Descend into the active case's payload. False for a unit case.
-    enter-payload: func() -> bool;
-    /// The flag names set at the cursor.
-    %flags: func() -> list<string>;
-    /// Ascend to the parent. Exactly one per successful `enter-*`.
-    exit: func();
-    /// Pull the value at the current cursor as a primitive leaf.
-    /// Width-specific getters return values matching the target param's
-    /// WIT width, so the tool passes types that match the param ABI.
-    get-string: func() -> string;
-    get-char: func() -> char;
-    get-bool: func() -> bool;
-    get-s8: func() -> s8;
-    get-s16: func() -> s16;
-    get-s32: func() -> s32;
-    get-s64: func() -> s64;
-    get-u8: func() -> u8;
-    get-u16: func() -> u16;
-    get-u32: func() -> u32;
-    get-u64: func() -> u64;
-    get-f32: func() -> f32;
-    get-f64: func() -> f64;
-  }
-}
-
-world simple-factory {
-  export factory;
-}
