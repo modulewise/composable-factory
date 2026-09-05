@@ -88,7 +88,7 @@ fn log(imports: &Imports, context: &str, message: &str) -> Result<()> {
 }
 
 wit_bindgen::generate!({
-    path: "wit",
+    path: "../wit",
     world: "logging-interceptor-factory",
     generate_all,
 });
