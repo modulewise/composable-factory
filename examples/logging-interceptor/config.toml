@@ -1,4 +1,4 @@
-[component.intercepted]
+[component.logging-greeter]
 uri = "factory:logging-greeter-factory"
 imports = ["greeter", "logger"]
 

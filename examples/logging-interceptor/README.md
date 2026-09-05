@@ -149,17 +149,31 @@ specifies a variant case. `ValueSpec` provides constructors to accommodate diffe
 ./run.sh
 ```
 
-It builds the factory, builds a filesystem loader to satisfy the `loader` import, pulls the
-`hello` target component and a `wasi:logging` implementation, then generates and invokes:
+It builds the factory, builds a filesystem loader used by the factory, pulls the `hello`
+target component and a `wasi:logging` implementation, then invokes the generated component:
 
 ```
-==> Invoking the intercepted greeter:
+==> Invoking the logging greeter:
 2026-08-20 13:53:10.990Z INFO  [greet]: called
 2026-08-20 13:53:10.990Z INFO  [greet]: returned
 "Hello World!"
 ```
 
-`factory-config.toml` wires the factory's imports and provides the target in config.
+`config.toml` wires the factory's loader import and provides the target in config:
 
-`greeter-config.toml` wires the generated component with the `hello` target component
-and a logging implementation. The loader is restricted to a read-only preopen.
+```toml
+[component.logging-greeter-factory]
+uri = "./lib/logging-interceptor-factory.wasm"
+imports = ["loader"]
+config.target = "hello.wasm"
+```
+
+The component to be generated on-demand specifies a URI referencing the factory:
+
+```toml
+[component.logging-greeter]
+uri = "factory:logging-greeter-factory"
+imports = ["greeter", "logger"]
+```
+
+The generated component then composes with its own imports: the greeter target and a logger.

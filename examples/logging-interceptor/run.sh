@@ -7,5 +7,5 @@ cd "$SCRIPT_DIR"
 
 ./build.sh
 
-echo "==> Invoking the intercepted greeter:"
-composable invoke config.toml -- intercepted.greeter.greet World
+echo "==> Invoking the logging greeter:"
+composable invoke config.toml -- logging-greeter.greeter.greet World
