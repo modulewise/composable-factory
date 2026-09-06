@@ -23,8 +23,8 @@ interface deserializer {
         // Descend into the active case's payload. False for a unit case.
         enter-payload: func() -> bool;
 
-        // The flag names set at the cursor.
-        %flags: func() -> list<string>;
+        // The flags set as bits at the positions corresponding to their names.
+        flag-bits: func(names: list<string>) -> result<u32, string>;
 
         // Ascend to the parent. Exactly one per successful `enter-*`.
         exit: func();

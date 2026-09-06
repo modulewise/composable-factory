@@ -13,10 +13,10 @@ use crate::abi;
 use crate::emitter::Emitter;
 use crate::values::{
     BuildContext, Len, Load, Loader, Local, Size, Slot, ValueRef, Writer, call_allocator,
-    load_ptr_len, member_slots, reserve,
+    flag_width, load_ptr_len, member_slots, reserve,
 };
 
-pub use crate::values::ValueSpec;
+pub use crate::values::{FlagSet, ValueSpec};
 
 /// One case of a variant-like WIT type. An enum's name is the whole value,
 /// where a `variant` (or option/result) case may have siblings with payloads.
@@ -739,33 +739,23 @@ impl Value {
     }
 
     /// Walk a flags bitset: test each declared flag's bit and report it within
-    /// that test. Any subset may be set. Flag `i` is bit `i % 32` of word
-    /// `i / 32`.
+    /// that test. Any subset may be set, one flag per bit.
     fn read_flags(&self, names: &[String], visitor: &mut dyn ReadVisitor) -> Result<()> {
-        let count = names.len();
-        for (index, name) in names.iter().enumerate() {
-            let word = index / 32;
-            let bit = index % 32;
+        let load = Load::for_tag(flag_width(names.len()));
+        for (bit, name) in names.iter().enumerate() {
             match &self.slot {
                 Slot::Memory { base, offset } => {
-                    let (load, at) = if count <= 8 {
-                        (Load::I32From8, *offset)
-                    } else if count <= 16 {
-                        (Load::I32From16, *offset)
-                    } else {
-                        (Load::I32, offset + word * 4)
-                    };
                     self.emit(Instruction::LocalGet(*base));
-                    self.emit(load.instruction(at));
+                    self.emit(load.instruction(*offset));
                 }
                 Slot::Flat { locals } => {
-                    let Some(local) = locals.get(word) else {
-                        bail!("flags need {} local(s), got {}", word + 1, locals.len());
+                    let Some(local) = locals.first() else {
+                        bail!("flags need a local, got none");
                     };
                     self.emit(Instruction::LocalGet(local.index));
                 }
             }
-            // if (word >> bit) & 1 { on_flag(name) }
+            // if (bits >> bit) & 1 { on_flag(name) }
             self.emit(Instruction::I32Const(bit as i32));
             self.emit(Instruction::I32ShrU);
             self.emit(Instruction::I32Const(1));
@@ -2717,7 +2707,7 @@ mod tests {
 
     #[test]
     fn flags_are_read_at_their_repr_width() {
-        // Two flags fit a u8 repr; a full-word load would read past the value.
+        // Two flags fit a u8 repr; a four-byte load would read past the value.
         let narrow = walk_bytes(
             r"package test:flagnarrow;
               interface i { flags perms { read, write } f: func(p: perms); }

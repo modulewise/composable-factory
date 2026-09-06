@@ -119,17 +119,25 @@ impl GuestDeserializer for Deserializer {
         }
     }
 
-    fn flags(&self) -> Vec<String> {
-        self.stack
-            .borrow()
-            .last()
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|f| f.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default()
+    fn flag_bits(&self, declared_names: Vec<String>) -> Result<u32, String> {
+        // The component model supports a max of 32 flags.
+        if declared_names.len() > 32 {
+            return Err(format!("at most 32 flags, got {}", declared_names.len()));
+        }
+        let mut bits = 0u32;
+        let stack = self.stack.borrow();
+        let Some(serde_json::Value::Array(set_names)) = stack.last() else {
+            return Ok(bits);
+        };
+        // Each flag's bit position matches the index of its declared name.
+        for name in set_names.iter().filter_map(|f| f.as_str()) {
+            let index = declared_names
+                .iter()
+                .position(|n| n == name)
+                .ok_or_else(|| format!("no flag '{name}'"))?;
+            bits |= 1u32 << index;
+        }
+        Ok(bits)
     }
 
     fn exit(&self) {
