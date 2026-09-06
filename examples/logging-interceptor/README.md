@@ -165,7 +165,7 @@ target component and a `wasi:logging` implementation, then invokes the generated
 [component.logging-greeter-factory]
 uri = "./lib/logging-interceptor-factory.wasm"
 imports = ["loader"]
-config.target = "hello.wasm"
+config.target = "/lib/hello.wasm"
 ```
 
 The component to be generated on-demand specifies a URI referencing the factory:

@@ -12,7 +12,7 @@ interface loader {
 }
 ```
 
-`source` is a path within the first preopened directory.
+`source` is a guest path, resolved against the loader's preopens.
 
 ## Configuring with Composable Runtime
 
@@ -23,7 +23,7 @@ capability can provide the preopens:
 [component.factory]
 uri = "./lib/my-factory.wasm"
 imports = ["loader"]
-config.target = "target.wasm"
+config.target = "/lib/target.wasm"
 
 [component.loader]
 uri = "oci://ghcr.io/modulewise/component/filesystem-loader:0.1.0"

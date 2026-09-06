@@ -4,24 +4,24 @@ wit_bindgen::generate!({
     generate_all,
 });
 
-use wasi::filesystem::types::{Descriptor, DescriptorFlags, OpenFlags, PathFlags};
+use wasi::filesystem::types::{DescriptorFlags, OpenFlags, PathFlags};
 
 struct FilesystemLoader;
 
-fn preopen() -> Result<Descriptor, String> {
-    wasi::filesystem::preopens::get_directories()
-        .into_iter()
-        .next()
-        .map(|(descriptor, _path)| descriptor)
-        .ok_or_else(|| "filesystem-loader: no preopened directory".to_string())
-}
-
 impl exports::composable::factory::loader::Guest for FilesystemLoader {
     async fn load(source: String) -> Result<Vec<u8>, String> {
-        let file = preopen()?
+        // Match the base path to find the right preopened directory.
+        let (directory, path) = wasi::filesystem::preopens::get_directories()
+            .into_iter()
+            .find_map(|(directory, base_path)| {
+                let path = source.strip_prefix(&base_path)?.strip_prefix('/')?;
+                Some((directory, path.to_string()))
+            })
+            .ok_or_else(|| format!("filesystem-loader: no preopen contains '{source}'"))?;
+        let file = directory
             .open_at(
                 PathFlags::empty(),
-                source.clone(),
+                path,
                 OpenFlags::empty(),
                 DescriptorFlags::READ,
             )

@@ -12,7 +12,7 @@ imports = ["wasip2"]
 [component.logging-greeter-factory]
 uri = "./lib/logging-interceptor-factory.wasm"
 imports = ["loader"]
-config.target = "hello.wasm"
+config.target = "/lib/hello.wasm"
 
 [component.loader]
 uri = "./lib/filesystem-loader.wasm"

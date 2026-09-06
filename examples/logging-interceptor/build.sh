@@ -12,14 +12,12 @@ cargo build --release --target wasm32-unknown-unknown
 
 echo "==> Componentizing -> lib/logging-interceptor-factory.wasm..."
 wasm-tools component new \
-  ../../target/wasm32-unknown-unknown/release/logging_interceptor_factory.wasm \
+  ../target/wasm32-unknown-unknown/release/logging_interceptor_factory.wasm \
   -o lib/logging-interceptor-factory.wasm
 
-if [[ ! -f lib/filesystem-loader.wasm ]]; then
-  echo "==> Building filesystem-loader..."
-  ( cd ../../components && ./build.sh >/dev/null )
-  cp ../../components/lib/filesystem-loader.wasm lib/
-fi
+echo "==> Building filesystem-loader..."
+( cd ../../components && ./build.sh >/dev/null )
+cp ../../components/lib/filesystem-loader.wasm lib/
 
 if [[ ! -f lib/hello.wasm ]]; then
   wkg oci pull -o lib/hello.wasm ghcr.io/modulewise/demo/hello:0.2.0
