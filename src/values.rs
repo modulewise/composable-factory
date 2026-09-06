@@ -225,6 +225,16 @@ pub enum Leaf {
     Source(ValueRef),
 }
 
+/// Which of a `flags` type's declared flags are set.
+pub enum FlagSet {
+    /// The named flags to set, matched against the type's declared flags.
+    /// Usable when the names are known at the time of emitting.
+    Named(Vec<String>),
+    /// The bits themselves, computed by the generated component at runtime.
+    /// Supplying them packed keeps the name matching out of that component.
+    Bits(ValueRef),
+}
+
 /// What to write into a value: a recipe, not a value itself.
 pub enum ValueSpec {
     Record(Vec<(String, ValueSpec)>),
@@ -237,7 +247,7 @@ pub enum ValueSpec {
     },
     List(Vec<ValueSpec>),
     Tuple(Vec<ValueSpec>),
-    Flags(Vec<String>),
+    Flags(FlagSet),
     Map(Vec<(ValueSpec, ValueSpec)>),
     Leaf(Leaf),
 }
@@ -371,8 +381,17 @@ impl ValueSpec {
         ValueSpec::Tuple(members.into_iter().map(Into::into).collect())
     }
 
+    /// The flags to set, named while emitting.
     pub fn flags(names: impl IntoIterator<Item = impl Into<String>>) -> ValueSpec {
-        ValueSpec::Flags(names.into_iter().map(Into::into).collect())
+        ValueSpec::Flags(FlagSet::Named(names.into_iter().map(Into::into).collect()))
+    }
+
+    /// The flags to set, as a bitset the generated component computes.
+    pub fn flag_bits(bits: impl Into<ValueSpec>) -> Result<ValueSpec> {
+        let ValueSpec::Leaf(Leaf::Source(source)) = bits.into() else {
+            bail!("flag bits must come from a value the component computes");
+        };
+        Ok(ValueSpec::Flags(FlagSet::Bits(source)))
     }
 
     pub fn map(entries: impl IntoIterator<Item = (ValueSpec, ValueSpec)>) -> ValueSpec {
@@ -494,17 +513,10 @@ impl<'a> Loader<'a> {
             }
             TypeDefKind::Enum(e) => self.leaf(base, offset, Load::for_tag(e.tag()), expected),
             TypeDefKind::Flags(flags) => {
-                // One i32 word per 32 flags.
-                for word in 0..expected.len() {
-                    self.leaf(
-                        base,
-                        offset + word * 4,
-                        Load::I32,
-                        &expected[word..word + 1],
-                    )?;
-                }
-                let _ = flags;
-                Ok(())
+                // A flags type is only as wide as its count needs, so a
+                // four-byte load could read past it into whatever follows.
+                let load = Load::for_tag(flag_width(flags.flags.len()));
+                self.leaf(base, offset, load, expected)
             }
             TypeDefKind::Option(inner) => {
                 self.load_variant(&[None, Some(inner)], Int::U8, base, offset, expected)
@@ -686,7 +698,7 @@ impl<'a> Writer<'a> {
         if let ValueSpec::Leaf(Leaf::Source(source)) = value {
             return match slot {
                 Slot::Flat { locals } => self.copy_flat_from(source, locals),
-                _ => self.copy_from(source, slot),
+                _ => self.copy_from(source, ty, slot),
             };
         }
         // A non-composite in a flat slot is the locals themselves, so there is
@@ -998,34 +1010,13 @@ impl<'a> Writer<'a> {
                     bail!("expected a Flags value for a flags type");
                 };
                 let count = declared.flags.len();
-                let words = flag_words(declared, set)?;
-                // Flat: the words are the value, one per repr word. Each is
-                // i32-natural and may land in a wider joined slot, so it
-                // reconciles like any other flat write.
-                if let Slot::Flat { locals } = slot {
-                    if words.len() > locals.len() {
-                        bail!("flags need {} local(s), got {}", words.len(), locals.len());
+                match set {
+                    FlagSet::Named(names) => {
+                        self.write_named_flags(count, flag_bits(declared, names)?, slot)
                     }
-                    for (local, bits) in locals.iter().zip(&words) {
-                        self.set_local_const(*local, *bits as i32)?;
-                    }
-                    return Ok(());
-                }
-                let (base, offset) = self.memory_dest(slot)?;
-                // No flags means no bytes: storing anything here would write
-                // past a zero-width value into whatever follows it.
-                let Some(&first) = words.first() else {
-                    return Ok(());
-                };
-                if count <= 8 {
-                    self.store_disc(base, offset, Int::U8, first as i64)
-                } else if count <= 16 {
-                    self.store_disc(base, offset, Int::U16, first as i64)
-                } else {
-                    for (index, bits) in words.iter().enumerate() {
-                        self.store_const_i32(base, offset + index * 4, *bits as i32)?;
-                    }
-                    Ok(())
+                    // The bits are already packed, so the only work here is
+                    // narrowing them to the type's repr width.
+                    FlagSet::Bits(bits) => self.write_flag_bits(count, bits, slot),
                 }
             }
             TypeDefKind::Map(key, value_ty) => {
@@ -1246,7 +1237,19 @@ impl<'a> Writer<'a> {
     /// after a 1-byte discriminant has gaps between its flats, and
     /// `memory.copy` of `size(ty)` bytes keeps them. A flat source has no
     /// padding; its flats are the value, so they are stored contiguously.
-    fn copy_from(&self, source: &ValueRef, dest: &Slot) -> Result<()> {
+    fn copy_from(&self, source: &ValueRef, ty: wit_parser::Type, dest: &Slot) -> Result<()> {
+        // Both arms below size the copy from the source, so a mismatched type
+        // could under-write the value or overrun it into whatever follows.
+        let (source_size, dest_size) = (
+            self.ctx.layout().size(&source.ty),
+            self.ctx.layout().size(&ty),
+        );
+        if source_size != dest_size {
+            bail!(
+                "a source of {source_size} byte(s) cannot be copied into a \
+                 destination of {dest_size}"
+            );
+        }
         let (base, offset) = self.memory_dest(dest)?;
         match &source.slot {
             Slot::Memory {
@@ -1284,6 +1287,38 @@ impl<'a> Writer<'a> {
                 Ok(())
             }
         }
+    }
+
+    /// Write a flags value whose set bits are known while emitting.
+    fn write_named_flags(&self, count: usize, bits: u32, slot: &Slot) -> Result<()> {
+        // Flat: the bitset is the value, i32-natural but may land in a wider
+        // joined slot, so it reconciles like any other flat write.
+        if let Slot::Flat { locals } = slot {
+            let Some(local) = locals.first() else {
+                bail!("flags need a local, got none");
+            };
+            return self.set_local_const(*local, bits as i32);
+        }
+        let (base, offset) = self.memory_dest(slot)?;
+        self.store_disc(base, offset, flag_width(count), bits as i64)
+    }
+
+    /// Write a flags value whose set bits the generated component computes.
+    ///
+    /// A flags type is only as wide as its declared count needs, so it can be
+    /// stored at the repr width rather than copied: a 4-byte store into a
+    /// 1-byte value would run past it.
+    fn write_flag_bits(&self, count: usize, bits: &ValueRef, slot: &Slot) -> Result<()> {
+        let source = Local::new(self.emitter.local(ValType::I32), ValType::I32);
+        self.copy_flat_from(bits, &[source])?;
+        if let Slot::Flat { locals } = slot {
+            let Some(local) = locals.first() else {
+                bail!("flags need a local, got none");
+            };
+            return self.set_local_from(*local, source);
+        }
+        let (base, offset) = self.memory_dest(slot)?;
+        self.store_local(base, offset, flag_width(count), source)
     }
 
     /// Copy a materialized value into locals.
@@ -1397,6 +1432,15 @@ impl<'a> Writer<'a> {
         self.emit(Instruction::LocalGet(base));
         self.emit(Instruction::I32Const(value));
         self.emit(Store::I32.instruction(offset));
+        Ok(())
+    }
+
+    /// Store a local at `base + offset`, narrowed to `width`. The runtime
+    /// counterpart of [`Writer::store_disc`], which stores a constant.
+    fn store_local(&self, base: u32, offset: usize, width: Int, source: Local) -> Result<()> {
+        self.emit(Instruction::LocalGet(base));
+        self.emit(Instruction::LocalGet(source.index));
+        self.emit(Store::for_tag(width).instruction(offset));
         Ok(())
     }
 
@@ -1645,32 +1689,40 @@ fn push_scalar(leaf: &Leaf, dest: wit_parser::Type) -> Result<(Instruction<'stat
     })
 }
 
-/// A `flags` value's bitset words, resolved from the named flags that are set.
+/// The integer width a `flags` type occupies based on its declared count (one
+/// flag per bit). Shared between the load and store paths so they agree.
+pub(crate) fn flag_width(count: usize) -> Int {
+    if count <= 8 {
+        Int::U8
+    } else if count <= 16 {
+        Int::U16
+    } else {
+        Int::U32
+    }
+}
+
+/// A `flags` value's bitset, resolved from the named flags that are set.
 ///
-/// Flag `i` is bit `i % 32` of word `i / 32`; the repr is one word for up to
-/// 16 flags, else `ceil(n/32)` of them. Shared by both memory and flat slots,
-/// so the two paths cannot drift on which names are valid.
-///
-/// A flags type with no flags occupies no bytes, so it yields no words. The
-/// count here must track `Flags::repr`, which returns `U32(0)` for that case:
-/// handing back a word for a zero-width type would write past the value.
-fn flag_words(flags: &wit_parser::Flags, set: &[String]) -> Result<Vec<u32>> {
-    let count = flags.flags.len();
-    let word_count = match count {
-        0 => 0,
-        n if n <= 16 => 1,
-        n => n.div_ceil(32),
-    };
-    let mut words = vec![0u32; word_count];
+/// One flag per bit, since the component model packs a flags type into one
+/// i32. Shared by both memory and flat slots, so the two paths cannot drift on
+/// which names are valid.
+fn flag_bits(flags: &wit_parser::Flags, set: &[String]) -> Result<u32> {
+    if flags.flags.is_empty() || flags.flags.len() > 32 {
+        bail!(
+            "the component model requires at least 1 and at most 32 flags, got {}",
+            flags.flags.len()
+        );
+    }
+    let mut bits = 0u32;
     for name in set {
         let index = flags
             .flags
             .iter()
             .position(|flag| &flag.name == name)
             .ok_or_else(|| anyhow!("no flag '{name}'"))?;
-        words[index / 32] |= 1u32 << (index % 32);
+        bits |= 1u32 << index;
     }
-    Ok(words)
+    Ok(bits)
 }
 
 /// A leaf load and the core type it produces.
@@ -2129,6 +2181,27 @@ mod tests {
         assert_eq!(flats, vec![ValType::I32]);
     }
 
+    #[test]
+    fn flags_load_at_their_repr_width() {
+        // Three flags fit a u8 repr, so a four-byte load would read past the
+        // value and carry whatever follows it into the bitset. Mirrors
+        // `read_flags`, which narrows the same way.
+        const I32_LOAD8U: u8 = 0x2D;
+        let ctx = context(
+            r"package test:flagload;
+              interface i { flags perms { read, write, exec } f: func(p: perms); }
+              world w { import i; }",
+        );
+        let ty = named_type(&ctx, "perms");
+        let emitter = Emitter::new(1);
+        Loader::new(&ctx, &emitter).load(ty, 0).expect("load");
+        let bytes = emitter.encode().expect("encode").into_raw_body();
+        assert!(
+            bytes.contains(&I32_LOAD8U),
+            "a 3-flag bitset is a one-byte load: {bytes:02x?}"
+        );
+    }
+
     /// Emit a write of `value` into a fresh memory area and validate the body.
     ///
     /// The allocator is declared as an import so the list/map paths, which call
@@ -2419,6 +2492,34 @@ mod tests {
     }
 
     #[test]
+    fn runtime_bits_are_stored_at_the_declared_width() {
+        // Three flags occupy one byte, so a `u32` of bits narrows to an
+        // i32.store8 rather than writing past the value.
+        let ctx = context(
+            r"package test:runtimeflags;
+              interface i { flags perms { read, write, exec } f: func(p: perms); }
+              world w { import i; }",
+        );
+        let ty = named_type(&ctx, "perms");
+        let emitter = Emitter::new(2);
+        let spec = ValueSpec::flag_bits(ValueSpec::source(ValueRef {
+            ty: wit_parser::Type::U32,
+            slot: Slot::at(1),
+        }))
+        .expect("a source is valid flag bits");
+        Writer::new(&ctx, &emitter)
+            .write(ty, &Slot::at(0), &spec)
+            .expect("write");
+        let function = emitter.encode().expect("encode");
+        let bytes =
+            validate_with_allocator(&ctx, function, vec![ValType::I32, ValType::I32], Vec::new());
+        assert!(
+            bytes.contains(&I32_STORE8),
+            "a one-byte flags type stores one byte: {bytes:02x?}"
+        );
+    }
+
+    #[test]
     fn each_flag_sets_the_bit_at_its_declared_position() {
         let ctx = context(
             r"package test:flagbits;
@@ -2436,42 +2537,11 @@ mod tests {
         };
         // Flag i is bit i, so read|exec is 0b101.
         assert_eq!(
-            flag_words(&flags, &["read".into(), "exec".into()]).expect("words"),
-            vec![0b101]
+            flag_bits(&flags, &["read".into(), "exec".into()]).expect("bits"),
+            0b101
         );
-        assert_eq!(
-            flag_words(&flags, &["write".into()]).expect("words"),
-            vec![0b010]
-        );
-        assert_eq!(flag_words(&flags, &[]).expect("words"), vec![0]);
-    }
-
-    #[test]
-    fn a_flag_past_the_first_word_sets_a_bit_in_its_own_word() {
-        let ctx = context(
-            r"package test:flagwords;
-              interface i {
-                flags wide {
-                  b00, b01, b02, b03, b04, b05, b06, b07, b08, b09, b10, b11,
-                  b12, b13, b14, b15, b16, b17, b18, b19, b20, b21, b22, b23,
-                  b24, b25, b26, b27, b28, b29, b30, b31, b32, b33
-                }
-                check: func(w: wide);
-              }
-              world w { import i; }",
-        );
-        let flags = match &ctx.resolve().types[match named_type(&ctx, "wide") {
-            wit_parser::Type::Id(id) => id,
-            other => panic!("expected a type id, got {other:?}"),
-        }]
-        .kind
-        {
-            TypeDefKind::Flags(flags) => flags.clone(),
-            other => panic!("expected flags, got {other:?}"),
-        };
-        // 34 flags need two words; b33 is bit 1 of word 1.
-        let words = flag_words(&flags, &["b00".into(), "b33".into()]).expect("words");
-        assert_eq!(words, vec![0b1, 0b10]);
+        assert_eq!(flag_bits(&flags, &["write".into()]).expect("bits"), 0b010);
+        assert_eq!(flag_bits(&flags, &[]).expect("bits"), 0);
     }
 
     #[test]
@@ -2528,15 +2598,60 @@ mod tests {
     }
 
     #[test]
+    fn a_flags_type_with_no_flags_is_rejected() {
+        // A zero-width type has nowhere to store its bits. This would not be
+        // valid according to the component model. Only reachable because
+        // wit-parser accepts it, hence the test.
+        let ctx = context(
+            r"package test:noflags;
+              interface i { flags none { } f: func(a: u32); }
+              world w { import i; }",
+        );
+        let ty = named_type(&ctx, "none");
+        let emitter = Emitter::new(0);
+        let slot = reserve(&ctx, &emitter, ty).expect("reserve");
+        let error = Writer::new(&ctx, &emitter)
+            .write(ty, &slot, &ValueSpec::flags(Vec::<String>::new()))
+            .expect_err("a flags type with no flags has no representation");
+        assert!(format!("{error:#}").contains("at least 1"), "{error:#}");
+    }
+
+    #[test]
+    fn a_flags_type_with_more_than_32_flags_is_rejected() {
+        // A flags type packs into one i32, so a wider one has no bit for its
+        // later flags. It would not be valid according to the component model.
+        // Only reachable because wit-parser accepts it, hence the test.
+        let ctx = context(
+            r"package test:manyflags;
+              interface i {
+                flags many {
+                  b00, b01, b02, b03, b04, b05, b06, b07, b08, b09,
+                  b10, b11, b12, b13, b14, b15, b16, b17, b18, b19,
+                  b20, b21, b22, b23, b24, b25, b26, b27, b28, b29,
+                  b30, b31, b32, b33
+                }
+                f: func(a: u32);
+              }
+              world w { import i; }",
+        );
+        let ty = named_type(&ctx, "many");
+        let emitter = Emitter::new(0);
+        let slot = reserve(&ctx, &emitter, ty).expect("reserve");
+        let error = Writer::new(&ctx, &emitter)
+            .write(ty, &slot, &ValueSpec::flags(["b00"]))
+            .expect_err("34 flags exceed the one i32 a flags type occupies");
+        assert!(format!("{error:#}").contains("at most 32"), "{error:#}");
+    }
+
+    #[test]
     fn a_zero_width_value_is_never_written_into() {
-        // `flags { }`, `record { }` and `tuple<>` all occupy no bytes, so
-        // their allocation is zero-sized. Any store into one would write past
-        // the value, into whatever the allocator hands out next: silent
-        // corruption that would both validate and run.
+        // `record { }` and `tuple<>` occupy no bytes, so their allocation is
+        // zero-sized. Any store into one would write past the value, into
+        // whatever the allocator hands out next: silent corruption that would
+        // both validate and run.
         let ctx = context(
             r"package test:zerowidth;
               interface i {
-                flags noflags { }
                 record norec { }
                 type notuple = tuple<>;
                 f: func(a: u32);
@@ -2544,7 +2659,6 @@ mod tests {
               world w { import i; }",
         );
         for (name, spec) in [
-            ("noflags", ValueSpec::flags(Vec::<String>::new())),
             (
                 "norec",
                 ValueSpec::record(Vec::<(String, ValueSpec)>::new()),
@@ -2565,28 +2679,6 @@ mod tests {
                 .count();
             assert_eq!(stores, 0, "{name} emits no store: {bytes:02x?}");
         }
-    }
-
-    #[test]
-    fn a_flags_type_with_no_flags_yields_no_words() {
-        // `Flags::repr` returns `U32(0)` for zero flags, so the word count
-        // must agree: handing back a word for a zero-width type would produce
-        // an out-of-bounds store.
-        let ctx = context(
-            r"package test:noflagwords;
-              interface i { flags empty { } f: func(e: empty); }
-              world w { import i; }",
-        );
-        let flags = match &ctx.resolve().types[match named_type(&ctx, "empty") {
-            wit_parser::Type::Id(id) => id,
-            other => panic!("expected a type id, got {other:?}"),
-        }]
-        .kind
-        {
-            TypeDefKind::Flags(flags) => flags.clone(),
-            other => panic!("expected flags, got {other:?}"),
-        };
-        assert!(flag_words(&flags, &[]).expect("words").is_empty());
     }
 
     #[test]

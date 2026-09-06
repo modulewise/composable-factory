@@ -1,6 +1,6 @@
-package composable:json-mapper;
+package composable:json-mapper@0.1.0;
 
 world json-mapper {
-    export composable:factory/serializer;
-    export composable:factory/deserializer;
+    export composable:factory/serializer@0.1.0;
+    export composable:factory/deserializer@0.1.0;
 }
