@@ -22,7 +22,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "filesystem-loader"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "wit-bindgen",
 ]
@@ -74,7 +74,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "json-mapper"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde_json",
  "wit-bindgen",

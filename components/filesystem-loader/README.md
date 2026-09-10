@@ -26,7 +26,7 @@ imports = ["loader"]
 config.target = "/lib/target.wasm"
 
 [component.loader]
-uri = "oci://ghcr.io/modulewise/component/filesystem-loader:0.1.0"
+uri = "oci://ghcr.io/modulewise/component/filesystem-loader:0.2.0"
 imports = ["filesystem"]
 
 [capability.filesystem]

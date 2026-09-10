@@ -51,7 +51,7 @@ uri = "factory:my-factory"
 imports = ["mapper"]
 
 [component.mapper]
-uri = "oci://ghcr.io/modulewise/component/json-mapper:0.1.0"
+uri = "oci://ghcr.io/modulewise/component/json-mapper:0.2.0"
 ```
 
 The factory drives it through a `ReadVisitor` (WIT to JSON) or `WriteVisitor` (JSON to WIT).
