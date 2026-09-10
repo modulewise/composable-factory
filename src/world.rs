@@ -43,6 +43,9 @@ impl WitCase {
 /// A variant-like WIT type's cases in discriminant order.
 type Cases = Vec<WitCase>;
 
+/// Limit for a record's field count since presence is reported as a bitmask.
+const FIELD_PRESENCE_LIMIT: usize = 32;
+
 /// A type at some position in the component's WIT. Reached from a function's
 /// params or result, and from there by descending through [`Kind`].
 #[derive(Clone)]
@@ -338,6 +341,20 @@ impl Value {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// What a record field's slot holds when the source did not supply it:
+    /// `none` for an `option`, otherwise a trap. Emitted into the branch that
+    /// runs when the field is absent.
+    fn write_absent(&self) -> Result<()> {
+        if !matches!(self.ty.kind(), Kind::Option(_)) {
+            self.emitter.trap();
+            return Ok(());
+        }
+        let (_, tag, payload_offset) = self.ty.variant_cases()?;
+        // `none` is case 0 and carries no payload, so the disc is sufficient.
+        self.write_disc(tag, 0, payload_offset)?;
         Ok(())
     }
 
@@ -831,10 +848,35 @@ impl Value {
                 let types: Vec<wit_parser::Type> =
                     fields.iter().map(|field| field.ty().wit()).collect();
                 let slots = member_slots(&self.ty.ctx, &self.slot, &types)?;
-                for (field, slot) in fields.iter().zip(slots) {
-                    visitor.begin_field(field.name())?;
-                    self.at_slot(field.ty(), slot).write_walk(visitor)?;
-                    visitor.end_field()?;
+
+                // Presence is reported as 1 bit per declared field, so a
+                // record cannot be wider than the mask (could expand later).
+                if fields.len() > FIELD_PRESENCE_LIMIT {
+                    bail!(
+                        "a record can have at most {FIELD_PRESENCE_LIMIT} fields, got {}",
+                        fields.len()
+                    );
+                }
+                let names: Vec<&str> = fields.iter().map(|field| field.name()).collect();
+                let present = self.local(ValType::I32);
+                visitor.field_presence(&names)?.push()?;
+                self.emit(Instruction::LocalSet(present));
+
+                for (index, (field, slot)) in fields.iter().zip(slots).enumerate() {
+                    let target = self.at_slot(field.ty(), slot);
+                    // Whether an absence is legal is decided by the field's
+                    // type, while emitting. Whether the field is absent is
+                    // reported by its bit, when the component runs.
+                    self.emit(Instruction::LocalGet(present));
+                    self.emit(Instruction::I32Const(1 << index));
+                    self.emit(Instruction::I32And);
+                    self.emitter
+                        .if_(BlockType::Empty, || {
+                            visitor.begin_field(field.name())?;
+                            target.write_walk(visitor)?;
+                            visitor.end_field()
+                        })?
+                        .else_(|| target.write_absent())?;
                 }
                 Ok(())
             }
@@ -1559,9 +1601,10 @@ pub trait ReadVisitor {
 /// receiving a value. Members are bracketed, but containers are not, since the
 /// visitor is asked for content at a position whose type it already knows.
 ///
-/// Two callbacks return a [`Value`] rather than a spec, because their answer
+/// Three callbacks return a [`Value`] rather than a spec, because their answer
 /// is only known when the component runs: how many elements a sequence has,
-/// and which case of a variant applies.
+/// which case of a variant applies, and which of a record's fields the source
+/// supplies.
 pub trait WriteVisitor {
     /// Fallback for any leaf kind not handled. Errors by default.
     fn on_other(&mut self, kind: &str) -> Result<ValueSpec> {
@@ -1704,6 +1747,17 @@ pub trait WriteVisitor {
     /// `names`. A [`Value`] for the same reason as [`WriteVisitor::length`].
     fn case_index(&mut self, _names: &[&str]) -> Result<Value> {
         bail!("producing a variant requires `case_index` (this visitor does not implement it)")
+    }
+
+    /// Which of a record's declared fields the source supplies, as a bitmask
+    /// where bit N is `names[N]`. This is a [`Value`] for the same reason as
+    /// [`WriteVisitor::length`]: the walk consumes it, emitting a test per
+    /// field so that an absent one traps or writes `none` based on its type.
+    ///
+    /// A name included in the source but not declared in the record is not
+    /// reported, so the visitor decides whether an undeclared key is an error.
+    fn field_presence(&mut self, _names: &[&str]) -> Result<Value> {
+        bail!("producing a record requires `field_presence` (this visitor does not implement it)")
     }
 }
 
@@ -2850,6 +2904,8 @@ mod tests {
         /// Which case `case_index` names and how long a sequence claims to be.
         case: usize,
         length: u32,
+        /// Field names absent from this supplier's source.
+        absent: Vec<String>,
         /// Set when a value is needed for a runtime answer.
         ctx: Rc<BuildContext>,
         emitter: Emitter,
@@ -2861,6 +2917,7 @@ mod tests {
                 events: Vec::new(),
                 case: 0,
                 length: 1,
+                absent: Vec::new(),
                 ctx: Rc::clone(ctx),
                 emitter: emitter.clone(),
             }
@@ -2935,21 +2992,40 @@ mod tests {
             self.note(format!("case?{}", names.join(",")));
             self.number(self.case as u32)
         }
+        fn field_presence(&mut self, names: &[&str]) -> Result<Value> {
+            self.note(format!("present?{}", names.join(",")));
+            // This supplier's source returns whatever it is asked for, except
+            // the names a test declares missing.
+            let mut bits = 0u32;
+            for (index, name) in names.iter().enumerate() {
+                if !self.absent.iter().any(|missing| missing == name) {
+                    bits |= 1 << index;
+                }
+            }
+            self.number(bits)
+        }
     }
 
     /// Build a named type's value from a supplier, returning what it was asked
     /// for. The emitted body is validated, so an invalid walk fails here.
     fn build(wit: &str, type_name: &str) -> Vec<String> {
+        build_without(wit, type_name, &[]).expect("build")
+    }
+
+    /// Like [`build`], but the supplier's source lacks the named fields, and
+    /// the walk's own error is returned rather than panicking.
+    fn build_without(wit: &str, type_name: &str, absent: &[&str]) -> Result<Vec<String>> {
         let ctx = context(wit);
         let ty = named_type_in(&ctx, type_name);
         let emitter = Emitter::new(1);
         let slot = reserve(&ctx, &emitter, ty.wit()).expect("reserve");
         let value = Value::new(ty, slot, emitter.clone());
         let mut supplier = Supplier::new(&ctx, &emitter);
-        value.write_with(&mut supplier).expect("build");
+        supplier.absent = absent.iter().map(|name| name.to_string()).collect();
+        value.write_with(&mut supplier)?;
         let function = emitter.encode().expect("encode");
         validate_with_allocator(&ctx, function, vec![ValType::I32]);
-        supplier.events
+        Ok(supplier.events)
     }
 
     /// Like `validate_body` but with the "alloc" import the write walk calls.
@@ -3013,8 +3089,9 @@ mod tests {
         );
         assert_eq!(
             events,
-            ["field:x", "leaf:u32", "field:y", "leaf:u64"],
-            "no begin_record: the write side brackets only positions it descends into"
+            ["present?x,y", "field:x", "leaf:u32", "field:y", "leaf:u64"],
+            "no begin_record: the write side brackets only positions it descends into, \
+             and asks up front which of them the source supplies"
         );
     }
 
@@ -3065,7 +3142,90 @@ mod tests {
         );
         assert_eq!(
             events,
-            ["field:a", "field:n", "leaf:u32", "field:b", "leaf:bool"]
+            [
+                "present?a,b",
+                "field:a",
+                // Each record asks about its own fields as it is reached.
+                "present?n",
+                "field:n",
+                "leaf:u32",
+                "field:b",
+                "leaf:bool"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_absent_field_is_not_descended_into() {
+        // Presence is a runtime fact, so both branches are emitted and the
+        // walk asks the supplier for the field's content, which is written
+        // within a conditional block.
+        let events = build_without(
+            r"package test:buildabsent;
+              interface i { record point { x: u32, y: u64 } f: func(p: point); }
+              world w { import i; }",
+            "point",
+            &["x"],
+        )
+        .expect("build");
+        assert_eq!(
+            events,
+            ["present?x,y", "field:x", "leaf:u32", "field:y", "leaf:u64"],
+            "the walk emits both arms, so it asks about every declared field"
+        );
+    }
+
+    #[test]
+    fn a_required_field_traps_but_an_option_writes_none() {
+        let required = build_bytes(
+            r"package test:buildreq;
+              interface i { record r { x: u32 } f: func(v: r); }
+              world w { import i; }",
+            "r",
+        );
+        assert!(
+            traps(&required),
+            "an absent `u32` field has nothing to write"
+        );
+        let optional = build_bytes(
+            r"package test:buildopt;
+              interface i { record r { x: option<u32> } f: func(v: r); }
+              world w { import i; }",
+            "r",
+        );
+        assert!(
+            !traps(&optional),
+            "an absent `option` field writes `none`, so nothing traps"
+        );
+    }
+
+    /// Whether a body contains `unreachable`. Reads operators rather than
+    /// bytes, since `unreachable`'s opcode is ambiguous.
+    fn traps(body: &[u8]) -> bool {
+        wasmparser::FunctionBody::new(wasmparser::BinaryReader::new(body, 0))
+            .get_operators_reader()
+            .expect("operators")
+            .into_iter()
+            .any(|op| matches!(op.expect("operator"), wasmparser::Operator::Unreachable))
+    }
+
+    #[test]
+    fn a_record_wider_than_the_presence_mask_is_rejected() {
+        // Presence is one bit per field, so a 33rd field has nowhere to be
+        // reported. It fails while emitting rather than overflowing at runtime.
+        let fields: Vec<String> = (0..=FIELD_PRESENCE_LIMIT)
+            .map(|index| format!("field{index}: u32"))
+            .collect();
+        let wit = format!(
+            r"package test:buildwide;
+              interface i {{ record wide {{ {} }} f: func(v: wide); }}
+              world w {{ import i; }}",
+            fields.join(", ")
+        );
+        let error = build_without(&wit, "wide", &[]).expect_err("too wide to report presence");
+        assert!(
+            error.to_string().contains("at most 32 fields"),
+            "unexpected error: {error}"
         );
     }
 

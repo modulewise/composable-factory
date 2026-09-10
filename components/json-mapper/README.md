@@ -22,7 +22,8 @@ finish: func() -> string;
 
 ```wit
 constructor(input: string);
-enter-field: func(name: string) -> bool;
+field-presence: func(names: list<string>) -> u32;
+enter-field: func(name: string);
 get-string: func() -> string;
 exit: func();
 ```
