@@ -35,21 +35,34 @@ impl GuestDeserializer for Deserializer {
         }
     }
 
-    fn enter_field(&self, name: String) -> bool {
+    fn field_presence(&self, names: Vec<String>) -> u32 {
+        let stack = self.stack.borrow();
+        let Some(serde_json::Value::Object(o)) = stack.last() else {
+            // Not an object, so it supplies no fields.
+            return 0;
+        };
+        let mut bits = 0u32;
+        for (index, name) in names.iter().enumerate().take(32) {
+            if o.contains_key(name) {
+                bits |= 1 << index;
+            }
+        }
+        bits
+    }
+
+    fn enter_field(&self, name: String) {
         let child = self
             .stack
             .borrow()
             .last()
             .and_then(|v| v.get(&name))
             .cloned();
-        match child {
-            Some(v) => {
-                self.stack.borrow_mut().push(v);
-                true
-            }
-            // Absent: the cursor does not move, so no `exit` is owed.
-            None => false,
-        }
+        // Only a field `field-presence` reported should be entered, so this
+        // indicates an invalid reader, and traps.
+        let Some(child) = child else {
+            panic!("enter-field: no field '{name}' after reporting it present");
+        };
+        self.stack.borrow_mut().push(child);
     }
 
     // A string-keyed map arrives as an object, every other sequence as an
@@ -102,21 +115,20 @@ impl GuestDeserializer for Deserializer {
         names.iter().position(|n| n == &active).map(|i| i as u32)
     }
 
-    fn enter_payload(&self) -> bool {
+    fn enter_payload(&self) {
         let child = self
             .stack
             .borrow()
             .last()
             .and_then(|v| v.get("value"))
             .cloned();
-        match child {
-            Some(v) => {
-                self.stack.borrow_mut().push(v);
-                true
-            }
-            // A unit case has no payload, nothing to descend, no `exit` owed.
-            None => false,
-        }
+        // A unit case should never be entered: the caller knows from the case
+        // this reader named in `case-index` whether it carries a payload. So a
+        // missing `value` means this is an invalid reader, and traps.
+        let Some(child) = child else {
+            panic!("enter-payload: the case named by case-index has no 'value'");
+        };
+        self.stack.borrow_mut().push(child);
     }
 
     fn flag_bits(&self, declared_names: Vec<String>) -> Result<u32, String> {
