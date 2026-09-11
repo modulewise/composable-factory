@@ -12,7 +12,7 @@ keywords = ["wasm", "webassembly", "wit"]
 [dependencies]
 anyhow = "1"
 indexmap = "2"
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 wasm-encoder = "0.258"
 wasmparser = "0.258"
 wit-component = "0.258"

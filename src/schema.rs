@@ -425,6 +425,27 @@ mod tests {
     }
 
     #[test]
+    fn properties_preserve_the_declared_order_of_params() {
+        let params = params_of(
+            r"package test:inputorder;
+              interface i { f: func(zebra: string, alpaca: u32, moose: bool); }
+              world w { import i; }",
+        );
+        let schema = input_schema(&params).to_string();
+        let properties = schema
+            .split(r#""properties":{"#)
+            .nth(1)
+            .expect("a properties object");
+        let first = properties.find(r#""zebra""#).expect("zebra");
+        let second = properties.find(r#""alpaca""#).expect("alpaca");
+        let third = properties.find(r#""moose""#).expect("moose");
+        assert!(
+            first < second && second < third,
+            "signature order, not alphabetical: {properties}"
+        );
+    }
+
+    #[test]
     fn an_optional_param_is_not_required() {
         let params = params_of(
             r"package test:optionalinput;
