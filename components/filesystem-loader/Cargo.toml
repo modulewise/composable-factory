@@ -1,6 +1,6 @@
 [package]
 name = "filesystem-loader"
-version = "0.2.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Filesystem loader component implementing the composable:factory/loader interface"
