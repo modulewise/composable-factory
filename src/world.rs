@@ -569,8 +569,22 @@ impl Value {
     /// The visitor supplies a spec per leaf node, and the walk writes into
     /// each corresponding slot, so nothing is returned. The value it was
     /// called on is the result.
+    ///
+    /// The visitor is first asked whether it has a value. If not, the type
+    /// determines what to do: an `option` becomes none, anything else traps.
     pub fn write_with(&self, visitor: &mut dyn WriteVisitor) -> Result<()> {
-        self.write_walk(visitor)?;
+        let present = self.local(ValType::I32);
+        visitor.begin_walk()?.push()?;
+        self.emit(Instruction::LocalSet(present));
+
+        self.emit(Instruction::LocalGet(present));
+        self.emitter
+            .if_(BlockType::Empty, || {
+                self.write_walk(visitor)?;
+                visitor.end_walk()
+            })?
+            .else_(|| self.write_absent())?;
+
         // A composite descends to member values, so leaf writes land on those.
         // What matters is that this value was the destination.
         self.written.set(true);
@@ -1666,6 +1680,21 @@ pub trait WriteVisitor {
     /// Supplies a `flags` value: which of `declared` are set.
     fn on_flags(&mut self, _declared: &[String]) -> Result<ValueSpec> {
         self.on_other("flags")
+    }
+
+    /// Whether this visitor has a value for the walk about to start. A
+    /// [`Value`] for the same reason as [`WriteVisitor::length`]: whether a
+    /// source holds something is only known when the component runs.
+    ///
+    /// The walk emits the branch, so a visitor answering "no" is never asked
+    /// for content. What an absence means is the walk's decision, based on the
+    /// type: an `option` becomes `none`, anything else traps.
+    fn begin_walk(&mut self) -> Result<Value> {
+        bail!("starting a walk requires `begin_walk` (this visitor does not implement it)")
+    }
+
+    fn end_walk(&mut self) -> Result<()> {
+        Ok(())
     }
 
     fn begin_field(&mut self, _name: &str) -> Result<()> {
@@ -2929,12 +2958,22 @@ mod tests {
 
         /// A `u32` value holding `n`, for the callbacks that answer with one.
         fn number(&self, n: u32) -> Result<Value> {
-            let ty = Type::new(Rc::clone(&self.ctx), wit_parser::Type::U32);
-            let slot = reserve(&self.ctx, &self.emitter, ty.wit())?;
-            let value = Value::new(ty, slot, self.emitter.clone());
-            value.write(&ValueSpec::u32(n))?;
-            Ok(value)
+            number_in(&self.ctx, &self.emitter, n)
         }
+    }
+
+    /// A `u32` value holding `n`, for a visitor's runtime answers.
+    fn number_in(ctx: &Rc<BuildContext>, emitter: &Emitter, n: u32) -> Result<Value> {
+        let ty = Type::new(Rc::clone(ctx), wit_parser::Type::U32);
+        let slot = reserve(ctx, emitter, ty.wit())?;
+        let value = Value::new(ty, slot, emitter.clone());
+        value.write(&ValueSpec::u32(n))?;
+        Ok(value)
+    }
+
+    /// What a visitor answers `begin_walk` with when it has a value to walk.
+    fn present(ctx: &Rc<BuildContext>, emitter: &Emitter) -> Result<Value> {
+        number_in(ctx, emitter, 1)
     }
 
     impl WriteVisitor for Supplier {
@@ -3003,6 +3042,10 @@ mod tests {
                 }
             }
             self.number(bits)
+        }
+        fn begin_walk(&mut self) -> Result<Value> {
+            // Always has a value to walk.
+            self.number(1)
         }
     }
 
@@ -3177,11 +3220,19 @@ mod tests {
 
     #[test]
     fn a_required_field_traps_but_an_option_writes_none() {
+        // `traps` scans a whole body, and every walk emits an absent branch
+        // for the value it starts from. Starting at an `option` makes that
+        // branch write `none`, leaving the field's own branch as the only one
+        // that can contribute a trap.
         let required = build_bytes(
             r"package test:buildreq;
-              interface i { record r { x: u32 } f: func(v: r); }
+              interface i {
+                record r { x: u32 }
+                type maybe = option<r>;
+                f: func(v: maybe);
+              }
               world w { import i; }",
-            "r",
+            "maybe",
         );
         assert!(
             traps(&required),
@@ -3189,9 +3240,13 @@ mod tests {
         );
         let optional = build_bytes(
             r"package test:buildopt;
-              interface i { record r { x: option<u32> } f: func(v: r); }
+              interface i {
+                record r { x: option<u32> }
+                type maybe = option<r>;
+                f: func(v: maybe);
+              }
               world w { import i; }",
-            "r",
+            "maybe",
         );
         assert!(
             !traps(&optional),
@@ -3503,8 +3558,6 @@ mod tests {
 
     #[test]
     fn a_write_visitor_that_supplies_nothing_fails_on_the_first_leaf() {
-        struct Nothing;
-        impl WriteVisitor for Nothing {}
         let ctx = context(
             r"package test:buildstrict;
               interface i { type n = u32; f: func(x: n); }
@@ -3513,8 +3566,15 @@ mod tests {
         let ty = named_type_in(&ctx, "n");
         let emitter = Emitter::new(1);
         let slot = reserve(&ctx, &emitter, ty.wit()).expect("reserve");
-        let error = Value::new(ty, slot, emitter)
-            .write_with(&mut Nothing)
+        // Walks successfully, so the leaf is what it fails on.
+        struct Nothing(Rc<BuildContext>, Emitter);
+        impl WriteVisitor for Nothing {
+            fn begin_walk(&mut self) -> Result<Value> {
+                present(&self.0, &self.1)
+            }
+        }
+        let error = Value::new(ty, slot, emitter.clone())
+            .write_with(&mut Nothing(Rc::clone(&ctx), emitter))
             .expect_err("an unsupplied leaf must fail");
         assert!(format!("{error:#}").contains("u32"), "{error:#}");
     }
@@ -3523,12 +3583,6 @@ mod tests {
     fn a_list_without_a_length_is_reported() {
         // `length` has no default: a visitor that produces sequences must
         // implement it.
-        struct NoLength;
-        impl WriteVisitor for NoLength {
-            fn on_other(&mut self, _kind: &str) -> Result<ValueSpec> {
-                Ok(ValueSpec::u32(0))
-            }
-        }
         let ctx = context(
             r"package test:buildnolen;
               interface i { type nums = list<u32>; f: func(n: nums); }
@@ -3537,8 +3591,17 @@ mod tests {
         let ty = named_type_in(&ctx, "nums");
         let emitter = Emitter::new(1);
         let slot = reserve(&ctx, &emitter, ty.wit()).expect("reserve");
-        let error = Value::new(ty, slot, emitter)
-            .write_with(&mut NoLength)
+        struct NoLength(Rc<BuildContext>, Emitter);
+        impl WriteVisitor for NoLength {
+            fn begin_walk(&mut self) -> Result<Value> {
+                present(&self.0, &self.1)
+            }
+            fn on_other(&mut self, _kind: &str) -> Result<ValueSpec> {
+                Ok(ValueSpec::u32(0))
+            }
+        }
+        let error = Value::new(ty, slot, emitter.clone())
+            .write_with(&mut NoLength(Rc::clone(&ctx), emitter))
             .expect_err("a list requires a length");
         assert!(format!("{error:#}").contains("length"), "{error:#}");
     }

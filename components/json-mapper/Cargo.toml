@@ -1,6 +1,6 @@
 [package]
 name = "json-mapper"
-version = "0.2.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "JSON mapper component implementing the composable:factory serializer and deserializer interfaces"

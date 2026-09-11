@@ -616,12 +616,21 @@ mod tests {
         // the first payload slot an i64, so the pointer widens into it.
         use crate::world::{Value, WriteVisitor};
 
-        // Answers the walk's two runtime queries through real imports.
+        // Answers the walk's runtime queries through real imports.
         struct Source {
             imports: Imports,
         }
 
         impl WriteVisitor for Source {
+            fn begin_walk(&mut self) -> Result<Value> {
+                Ok(self
+                    .imports
+                    .interface("source")?
+                    .function("has-value")?
+                    .call(&[])?
+                    .expect("has-value returns a u32"))
+            }
+
             fn length(&mut self) -> Result<Value> {
                 Ok(self
                     .imports
@@ -662,6 +671,7 @@ mod tests {
                         accept: func(v: joined);
                       }
                       interface source {
+                        has-value: func() -> u32;
                         length: func() -> u32;
                         case-index: func(names: list<string>) -> u32;
                       }

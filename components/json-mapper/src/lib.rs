@@ -35,6 +35,24 @@ impl GuestDeserializer for Deserializer {
         }
     }
 
+    fn enter_value(&self, name: String) -> bool {
+        let child = self
+            .stack
+            .borrow()
+            .last()
+            .and_then(|v| v.get(&name))
+            .cloned();
+
+        match child {
+            Some(v) => {
+                self.stack.borrow_mut().push(v);
+                true
+            }
+            // Absent: the cursor does not move, so no `exit` is owed.
+            None => false,
+        }
+    }
+
     fn field_presence(&self, names: Vec<String>) -> u32 {
         let stack = self.stack.borrow();
         let Some(serde_json::Value::Object(o)) = stack.last() else {
