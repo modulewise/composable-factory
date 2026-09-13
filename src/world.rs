@@ -921,6 +921,10 @@ impl Value {
                 }
                 Ok(())
             }
+            // An option is variant-like but the walk asks whether there is a
+            // value present, not which of the case names applies. A visitor
+            // reading a source can answer that without being told case names.
+            Kind::Option(_) => self.write_option(visitor),
             kind if kind.is_variant_like() => self.write_variant(visitor),
             Kind::List(elem) => self.write_sequence(&[elem.wit()], Bracket::Element, visitor),
             Kind::Map(key, value) => {
@@ -987,6 +991,17 @@ impl Value {
         let case_index = visitor.case_index(&names)?;
         let disc = self.local(ValType::I32);
         case_index.push()?;
+        self.emit(Instruction::LocalSet(disc));
+        self.write_cases(&cases, 0, disc, visitor)
+    }
+
+    /// Build an `option`: ask whether the visitor has a value, then emit the
+    /// same dispatch a variant emits. `none` is case 0 and `some` case 1, so
+    /// the answer is the discriminant.
+    fn write_option(&self, visitor: &mut dyn WriteVisitor) -> Result<()> {
+        let (cases, ..) = self.ty.variant_cases()?;
+        let disc = self.local(ValType::I32);
+        visitor.has_value()?.push()?;
         self.emit(Instruction::LocalSet(disc));
         self.write_cases(&cases, 0, disc, visitor)
     }
@@ -1615,10 +1630,11 @@ pub trait ReadVisitor {
 /// receiving a value. Members are bracketed, but containers are not, since the
 /// visitor is asked for content at a position whose type it already knows.
 ///
-/// Three callbacks return a [`Value`] rather than a spec, because their answer
-/// is only known when the component runs: how many elements a sequence has,
-/// which case of a variant applies, and which of a record's fields the source
-/// supplies.
+/// Several callbacks return a [`Value`] rather than a spec, because their
+/// answer is only known when the component runs: whether the source has the
+/// value a walk starts from, how many elements a sequence has, which case of a
+/// variant applies, whether an option has a value, and which of a record's
+/// fields the source supplies.
 pub trait WriteVisitor {
     /// Fallback for any leaf kind not handled. Errors by default.
     fn on_other(&mut self, kind: &str) -> Result<ValueSpec> {
@@ -1776,6 +1792,14 @@ pub trait WriteVisitor {
     /// `names`. A [`Value`] for the same reason as [`WriteVisitor::length`].
     fn case_index(&mut self, _names: &[&str]) -> Result<Value> {
         bail!("producing a variant requires `case_index` (this visitor does not implement it)")
+    }
+
+    /// Whether the source has a value for the `option` being built, as its
+    /// discriminant: `none` is 0 and `some` is 1. A [`Value`] because it is
+    /// only known at runtime. Separate from [`WriteVisitor::case_index`]
+    /// because a source can report presence without matching case names.
+    fn has_value(&mut self) -> Result<Value> {
+        bail!("producing an option requires `has_value` (this visitor does not implement it)")
     }
 
     /// Which of a record's declared fields the source supplies, as a bitmask
@@ -3031,6 +3055,10 @@ mod tests {
             self.note(format!("case?{}", names.join(",")));
             self.number(self.case as u32)
         }
+        fn has_value(&mut self) -> Result<Value> {
+            self.note("value?");
+            self.number(self.case as u32)
+        }
         fn field_presence(&mut self, names: &[&str]) -> Result<Value> {
             self.note(format!("present?{}", names.join(",")));
             // This supplier's source returns whatever it is asked for, except
@@ -3492,14 +3520,14 @@ mod tests {
     }
 
     #[test]
-    fn an_option_asks_which_case_and_builds_the_some_payload() {
+    fn an_option_asks_whether_there_is_a_value_and_builds_the_payload() {
         let events = build(
             r"package test:buildopt;
               interface i { type maybe = option<u32>; f: func(m: maybe); }
               world w { import i; }",
             "maybe",
         );
-        assert_eq!(events, ["case?none,some", "payload", "leaf:u32"]);
+        assert_eq!(events, ["value?", "payload", "leaf:u32"]);
     }
 
     #[test]

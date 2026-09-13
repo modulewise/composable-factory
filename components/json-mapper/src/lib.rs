@@ -133,13 +133,28 @@ impl GuestDeserializer for Deserializer {
         names.iter().position(|n| n == &active).map(|i| i as u32)
     }
 
+    fn has_value(&self) -> bool {
+        // A value is `some` when present and `none` when `null` or absent,
+        // whether wrapped or not.
+        match self.stack.borrow().last() {
+            Some(serde_json::Value::Null) | None => false,
+            Some(serde_json::Value::Object(o)) if o.contains_key("type") => {
+                o.get("type").and_then(|c| c.as_str()) == Some("some")
+            }
+            Some(_) => true,
+        }
+    }
+
     fn enter_payload(&self) {
-        let child = self
-            .stack
-            .borrow()
-            .last()
-            .and_then(|v| v.get("value"))
-            .cloned();
+        let current = self.stack.borrow().last().cloned();
+        let child = match current {
+            // The tagged form carries its payload under `value`.
+            Some(serde_json::Value::Object(ref o)) if o.contains_key("type") => {
+                o.get("value").cloned()
+            }
+            // An untagged value reported present by `has-value` is its payload.
+            other => other,
+        };
         // A unit case should never be entered: the caller knows from the case
         // this reader named in `case-index` whether it carries a payload. So a
         // missing `value` means this is an invalid reader, and traps.
@@ -196,10 +211,13 @@ impl GuestDeserializer for Deserializer {
     }
 
     fn get_bool(&self) -> bool {
-        matches!(
-            self.stack.borrow().last(),
-            Some(serde_json::Value::Bool(true))
-        )
+        // `"true"` and `"false"` (case-insensitive) are also read as booleans,
+        // so a source that only provides strings can supply them.
+        match self.stack.borrow().last() {
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(serde_json::Value::String(s)) => s.eq_ignore_ascii_case("true"),
+            _ => false,
+        }
     }
 
     fn get_s8(&self) -> i8 {
@@ -235,26 +253,27 @@ impl GuestDeserializer for Deserializer {
 }
 
 impl Deserializer {
+    // A number in a JSON string still reads as that number. This allows a
+    // source that only provides strings, such as a header, to supply one.
     fn as_i64(&self) -> i64 {
-        self.stack
-            .borrow()
-            .last()
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0)
+        self.number(serde_json::Value::as_i64).unwrap_or(0)
     }
     fn as_u64(&self) -> u64 {
-        self.stack
-            .borrow()
-            .last()
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0)
+        self.number(serde_json::Value::as_u64).unwrap_or(0)
     }
     fn as_f64(&self) -> f64 {
-        self.stack
-            .borrow()
-            .last()
-            .and_then(|v| v.as_f64())
+        self.number(serde_json::Value::as_f64)
+            // A string may parse to a float JSON cannot express, which the
+            // serializer would then write as invalid JSON.
+            .filter(|f| f.is_finite())
             .unwrap_or(0.0)
+    }
+
+    /// The number at the cursor via `read`, accepting one held as a string.
+    fn number<T>(&self, read: fn(&serde_json::Value) -> Option<T>) -> Option<T> {
+        let stack = self.stack.borrow();
+        let value = stack.last()?;
+        read(value).or_else(|| read(&value.as_str()?.parse::<serde_json::Value>().ok()?))
     }
 }
 
