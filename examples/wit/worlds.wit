@@ -1,12 +1,12 @@
-package composable-factory:examples@0.3.0;
+package composable-factory:examples@0.4.0;
 
 world simple-factory {
-    export composable:factory/factory@0.3.0;
+    export composable:factory/factory@0.4.0;
 }
 
 world logging-interceptor-factory {
     import wasi:config/store@0.2.0-rc.1;
-    import composable:factory/loader@0.3.0;
+    import composable:factory/loader@0.4.0;
 
-    export composable:factory/factory@0.3.0;
+    export composable:factory/factory@0.4.0;
 }
