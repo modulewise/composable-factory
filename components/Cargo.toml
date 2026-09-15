@@ -13,4 +13,4 @@ repository = "https://github.com/modulewise/composable-factory"
 
 [workspace.dependencies]
 serde_json = "1"
-wit-bindgen = "0.61"
+wit-bindgen = "0.62"

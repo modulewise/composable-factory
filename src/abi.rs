@@ -192,10 +192,10 @@ pub struct Layout {
 
 impl Layout {
     /// Built once per resolve, since it walks every type in the arena.
-    pub fn new(resolve: &Resolve) -> Self {
+    pub fn new(resolve: &Resolve) -> Result<Self> {
         let mut sizes = SizeAlign::default();
-        sizes.fill(resolve);
-        Layout { sizes }
+        sizes.fill(resolve)?;
+        Ok(Layout { sizes })
     }
 
     /// The bytes `ty` occupies.
@@ -969,7 +969,7 @@ mod tests {
     #[test]
     fn primitive_sizes_are_their_byte_widths() {
         let (resolve, _) = world(r"package test:sizes; world w { export f: func(); }");
-        let layout = Layout::new(&resolve);
+        let layout = Layout::new(&resolve).expect("layout");
         assert_eq!(layout.size(&wit_parser::Type::U8), 1);
         assert_eq!(layout.size(&wit_parser::Type::U16), 2);
         assert_eq!(layout.size(&wit_parser::Type::U32), 4);
@@ -985,7 +985,7 @@ mod tests {
               interface iface { record r { a: u8, b: u64, c: u8 } f: func(x: r); }
               world w { import iface; }",
         );
-        let layout = Layout::new(&resolve);
+        let layout = Layout::new(&resolve).expect("layout");
         let fields = [
             wit_parser::Type::U8,
             wit_parser::Type::U64,
@@ -1008,7 +1008,7 @@ mod tests {
               }
               world w { import iface; }",
         );
-        let layout = Layout::new(&resolve);
+        let layout = Layout::new(&resolve).expect("layout");
         let cases = [Some(&wit_parser::Type::U8), Some(&wit_parser::Type::U64)];
         // A 1-byte discriminant, then padding to the widest case's alignment.
         assert_eq!(layout.payload_offset(Int::U8, cases), 8);

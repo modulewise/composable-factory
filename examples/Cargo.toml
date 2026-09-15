@@ -13,5 +13,5 @@ edition = "2024"
 [workspace.dependencies]
 anyhow = "1"
 composable-factory = { path = ".." }
-wasm-encoder = "0.258"
-wit-bindgen = "0.61"
+wasm-encoder = "0.259"
+wit-bindgen = "0.62"

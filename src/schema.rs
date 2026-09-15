@@ -212,7 +212,7 @@ mod tests {
                 _ => None,
             })
             .expect("the declared type");
-        let ctx = Rc::new(BuildContext::new(Rc::new(resolve), world));
+        let ctx = Rc::new(BuildContext::new(Rc::new(resolve), world).expect("context"));
         schema(Type::new(ctx, wit_parser::Type::Id(id)))
     }
 
@@ -394,7 +394,7 @@ mod tests {
         let mut resolve = Resolve::new();
         let package = resolve.push_str("test.wit", wit).expect("parse");
         let world = resolve.select_world(&[package], None).expect("one world");
-        let ctx = Rc::new(BuildContext::new(Rc::new(resolve), world));
+        let ctx = Rc::new(BuildContext::new(Rc::new(resolve), world).expect("context"));
         crate::world::Imports::new(ctx, crate::emitter::Emitter::new(0))
             .interface("i")
             .expect("the interface")
