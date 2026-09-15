@@ -34,7 +34,10 @@ impl Component {
         self,
         build_function: impl Fn(&ExportedFunction, &Imports) -> Result<()>,
     ) -> Result<Built> {
-        let ctx = Rc::new(BuildContext::new(Rc::new(self.resolve.clone()), self.world));
+        let ctx = Rc::new(BuildContext::new(
+            Rc::new(self.resolve.clone()),
+            self.world,
+        )?);
         let mut generated = Vec::new();
         for entry in abi::export_entries(&self.resolve, self.world) {
             let func = abi::exported_function(

@@ -2363,7 +2363,7 @@ mod tests {
     /// The context for `wit`'s sole world.
     fn context(wit: &str) -> Rc<BuildContext> {
         let (resolve, world) = world(wit);
-        Rc::new(BuildContext::new(resolve, world))
+        Rc::new(BuildContext::new(resolve, world).expect("context"))
     }
 
     fn world(wit: &str) -> (Rc<Resolve>, WorldId) {

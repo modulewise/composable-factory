@@ -40,18 +40,18 @@ struct ModuleState {
 }
 
 impl BuildContext {
-    pub fn new(resolve: Rc<Resolve>, world: WorldId) -> Self {
-        let layout = Layout::new(&resolve);
+    pub fn new(resolve: Rc<Resolve>, world: WorldId) -> Result<Self> {
+        let layout = Layout::new(&resolve)?;
         let imports = abi::import_entries(&resolve, world);
         let allocator = abi::allocator_index(&resolve, world);
-        BuildContext {
+        Ok(BuildContext {
             resolve,
             world,
             layout,
             imports,
             allocator,
             module_state: RefCell::new(ModuleState::default()),
-        }
+        })
     }
 
     pub(crate) fn resolve(&self) -> &Resolve {
@@ -1897,7 +1897,7 @@ mod tests {
         let mut resolve = Resolve::new();
         let package = resolve.push_str("test.wit", wit).expect("parse");
         let world = resolve.select_world(&[package], None).expect("one world");
-        BuildContext::new(Rc::new(resolve), world)
+        BuildContext::new(Rc::new(resolve), world).expect("context")
     }
 
     const WORLD: &str = r"package test:ctx;
@@ -2560,7 +2560,7 @@ mod tests {
             )
             .expect("parse");
         let world = resolve.select_world(&[package], None).expect("one world");
-        let ctx = Rc::new(BuildContext::new(Rc::new(resolve.clone()), world));
+        let ctx = Rc::new(BuildContext::new(Rc::new(resolve.clone()), world).expect("context"));
         let emitter = Emitter::new(0);
         let list = resolve.worlds[world]
             .imports
