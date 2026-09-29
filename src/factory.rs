@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use wit_parser::{InterfaceId, Resolve, TypeId, WorldId, WorldItem, WorldKey};
 
 use crate::component::Component;
@@ -156,9 +156,23 @@ impl WorldBuilder {
 
         let mut imports = indexmap::IndexMap::new();
         let mut exports = indexmap::IndexMap::new();
-        for (members, into) in [(&self.imports, &mut imports), (&self.exports, &mut exports)] {
+        // Inline interfaces are copied into the world's package after the rest.
+        let mut inline = Vec::new();
+        for (role, members, into) in [
+            (Role::Import, &self.imports, &mut imports),
+            (Role::Export, &self.exports, &mut exports),
+        ] {
             for member in members {
                 match member {
+                    Member::Interface {
+                        id,
+                        explicit_name: Some(name),
+                    } if self.resolve.interfaces[*id].name.is_none() => {
+                        let member = (role, name.clone(), *id);
+                        if !inline.contains(&member) {
+                            inline.push(member);
+                        }
+                    }
                     Member::Interface { id, explicit_name } => {
                         let key = match explicit_name {
                             Some(name) => WorldKey::Name(name.clone()),
@@ -200,10 +214,71 @@ impl WorldBuilder {
         let declared = &mut self.resolve.worlds[world];
         declared.imports = imports;
         declared.exports = exports;
+        let sources: Vec<WorldId> = inline
+            .into_iter()
+            .map(|(role, name, id)| self.inline_source(role, name, id))
+            .collect::<Result<_>>()?;
         // Merging even an empty Resolve fires `elaborate_world`, which
         // back-fills the provider imports every member's `use`d types need.
         self.resolve.merge(Resolve::default())?;
+        // An inline interface must belong to the package of the world that
+        // declares it, so merging copies it, and the types it owns, into the
+        // package of the world being built.
+        for source in sources {
+            self.resolve
+                .merge_worlds(source, world, &mut wit_parser::CloneMaps::default())?;
+        }
         Ok((self.resolve, world))
+    }
+
+    /// A world declaring only the inline interface `id` as `name` in `role`,
+    /// in the interface's own package.
+    fn inline_source(&mut self, role: Role, name: String, id: InterfaceId) -> Result<WorldId> {
+        use wit_parser::{Stability, World as WitWorld};
+
+        let package = self.resolve.interfaces[id]
+            .package
+            .ok_or_else(|| anyhow!("inline interface '{name}' has no package"))?;
+        let item = WorldItem::Interface {
+            id,
+            stability: Stability::Unknown,
+            span: wit_parser::Span::default(),
+            docs: Default::default(),
+            external_id: None,
+        };
+        let items = indexmap::IndexMap::from([(WorldKey::Name(name.clone()), item)]);
+        let (world_name, imports, exports) = match role {
+            Role::Import => (
+                format!("{WORLD_NAME}-import-{name}"),
+                items,
+                Default::default(),
+            ),
+            Role::Export => (
+                format!("{WORLD_NAME}-export-{name}"),
+                Default::default(),
+                items,
+            ),
+        };
+        if self.resolve.packages[package]
+            .worlds
+            .contains_key(&world_name)
+        {
+            bail!("the package of inline interface '{name}' already has a world '{world_name}'");
+        }
+        let source = self.resolve.worlds.alloc(WitWorld {
+            name: world_name.clone(),
+            imports,
+            exports,
+            package: Some(package),
+            docs: Default::default(),
+            stability: Stability::Unknown,
+            includes: Vec::new(),
+            span: wit_parser::Span::default(),
+        });
+        self.resolve.packages[package]
+            .worlds
+            .insert(world_name, source);
+        Ok(source)
     }
 
     /// Give the authored world its own `use` aliases for the foreign types its
@@ -598,6 +673,127 @@ mod tests {
         .expect("build");
         validate(&bytes);
         assert_eq!(world_names(&bytes, false), ["first", "second"]);
+    }
+
+    #[test]
+    fn an_inline_interface_from_a_source_world_may_be_imported() {
+        let bytes = build(&Factory {
+            wit: r"package test:inline;
+                   interface greeter { greet: func() -> string; }
+                   world target {
+                     import helper: interface { help: func() -> string; }
+                     export greeter;
+                   }",
+            declare: |world, package| {
+                let target = package.world("target")?;
+                world.add_imports(target.imports())?;
+                world.add_exports(target.exports())
+            },
+            body: |function, imports| {
+                let helped = imports
+                    .interface("helper")?
+                    .function("help")?
+                    .call(&[])?
+                    .expect("help returns a string");
+                function
+                    .result()
+                    .expect("greet returns a string")
+                    .value()
+                    .write(&ValueSpec::from(helped))
+            },
+        })
+        .expect("build");
+        validate(&bytes);
+        assert_eq!(world_names(&bytes, true), ["helper"]);
+        assert_eq!(world_names(&bytes, false), ["test:inline/greeter"]);
+    }
+
+    #[test]
+    fn an_inline_interface_from_a_source_world_may_be_exported() {
+        let bytes = build(&Factory {
+            wit: r"package test:inline;
+                   world target { export helper: interface { help: func() -> string; } }",
+            declare: |world, package| world.add_exports(package.world("target")?.exports()),
+            body: |function, _| {
+                function
+                    .result()
+                    .expect("help returns a string")
+                    .value()
+                    .write(&ValueSpec::string("helped"))
+            },
+        })
+        .expect("build");
+        validate(&bytes);
+        assert_eq!(world_names(&bytes, false), ["helper"]);
+    }
+
+    #[test]
+    fn adding_the_same_inline_interface_twice_records_it_once() {
+        let bytes = build(&Factory {
+            wit: r"package test:inline;
+                   world target { export helper: interface { help: func() -> string; } }",
+            declare: |world, package| {
+                let target = package.world("target")?;
+                world.add_exports(target.exports())?;
+                world.add_exports(target.exports())
+            },
+            body: |function, _| {
+                function
+                    .result()
+                    .expect("help returns a string")
+                    .value()
+                    .write(&ValueSpec::string("helped"))
+            },
+        })
+        .expect("build");
+        validate(&bytes);
+        assert_eq!(world_names(&bytes, false), ["helper"]);
+    }
+
+    #[test]
+    fn an_inline_interface_whose_source_world_name_is_taken_is_rejected() {
+        let Err(error) = build(&Factory {
+            wit: r"package test:clash;
+                   world target { export helper: interface { help: func() -> string; } }
+                   world built-world-export-helper {}",
+            declare: |world, package| world.add_exports(package.world("target")?.exports()),
+            body: |_, _| Ok(()),
+        }) else {
+            panic!("the package already has a world of that name");
+        };
+        assert!(
+            format!("{error:#}").contains("already has a world"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn an_inline_interface_brings_the_imports_its_types_need() {
+        let bytes = build(&Factory {
+            wit: r"package test:inline;
+                   interface types { record point { x: u32, y: u32 } }
+                   world target {
+                     export helper: interface {
+                       use types.{point};
+                       origin: func() -> point;
+                     }
+                   }",
+            declare: |world, package| world.add_exports(package.world("target")?.exports()),
+            body: |function, _| {
+                function
+                    .result()
+                    .expect("origin returns a point")
+                    .value()
+                    .write(&ValueSpec::record([
+                        ("x", ValueSpec::u32(0)),
+                        ("y", ValueSpec::u32(0)),
+                    ]))
+            },
+        })
+        .expect("build");
+        validate(&bytes);
+        assert_eq!(world_names(&bytes, true), ["test:inline/types"]);
+        assert_eq!(world_names(&bytes, false), ["helper"]);
     }
 
     #[test]
