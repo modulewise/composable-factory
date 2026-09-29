@@ -47,12 +47,7 @@ impl ComponentBuilder for Builder {
             .iter()
             .map(|p| p.receive())
             .collect::<Result<Vec<_>>>()?;
-        let result = target_function(
-            imports,
-            function.qualified_interface_name().as_deref(),
-            function.name(),
-        )?
-        .call(&args)?;
+        let result = target_function(imports, function)?.call(&args)?;
         log(imports, &name, "returned")?;
 
         // Write the target's result.
@@ -63,10 +58,14 @@ impl ComponentBuilder for Builder {
     }
 }
 
-fn target_function(imports: &Imports, iface: Option<&str>, func: &str) -> Result<ImportedFunction> {
-    match iface {
-        Some(iface) => imports.interface(iface)?.function(func),
-        None => imports.function(func),
+// The target function an export mirrors. An interface function is found
+// through the import with the same name as its interface's export.
+fn target_function(imports: &Imports, function: &ExportedFunction) -> Result<ImportedFunction> {
+    match function.interface() {
+        Some(interface) => imports
+            .interface(&interface.export_name())?
+            .function(function.name()),
+        None => imports.function(function.name()),
     }
 }
 

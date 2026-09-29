@@ -66,8 +66,12 @@ struct WorldBuilder {
 
 /// One recorded membership, by its identity in the superset.
 enum Member {
-    /// An interface, which brings its own functions and types.
-    Interface(InterfaceId),
+    /// An interface, which brings its own functions and types, with its
+    /// explicit name if it has one.
+    Interface {
+        id: InterfaceId,
+        explicit_name: Option<String>,
+    },
     /// A world-level function: its name and declaring world.
     Function { world: WorldId, name: String },
 }
@@ -90,11 +94,12 @@ impl WorldBuilder {
     /// selected as members of `role`.
     fn add(&mut self, selection: Selection, role: Role) -> Result<()> {
         let remap = self.resolve.merge(selection.resolve.clone())?;
-        for id in &selection.interfaces {
+        for (explicit_name, id) in &selection.interfaces {
             let id = remap
                 .map_interface(*id, wit_parser::Span::default())
                 .map_err(|error| anyhow!("{error}"))?;
-            self.push(role, Member::Interface(id));
+            let explicit_name = explicit_name.clone();
+            self.push(role, Member::Interface { id, explicit_name });
         }
         // World-level functions are rooted in the world that declared them.
         let Some(source) = selection.world else {
@@ -154,9 +159,13 @@ impl WorldBuilder {
         for (members, into) in [(&self.imports, &mut imports), (&self.exports, &mut exports)] {
             for member in members {
                 match member {
-                    Member::Interface(id) => {
+                    Member::Interface { id, explicit_name } => {
+                        let key = match explicit_name {
+                            Some(name) => WorldKey::Name(name.clone()),
+                            None => WorldKey::Interface(*id),
+                        };
                         into.insert(
-                            WorldKey::Interface(*id),
+                            key,
                             WorldItem::Interface {
                                 id: *id,
                                 stability: Stability::Unknown,
@@ -473,6 +482,122 @@ mod tests {
         })
         .expect("build");
         validate(&bytes);
+    }
+
+    /// The names of a built component's imports or exports.
+    fn world_names(component: &[u8], imports: bool) -> Vec<String> {
+        let wit_parser::decoding::DecodedWasm::Component(resolve, world) =
+            wit_parser::decoding::decode(component).expect("decode")
+        else {
+            panic!("a component");
+        };
+        let world = &resolve.worlds[world];
+        let items = if imports {
+            &world.imports
+        } else {
+            &world.exports
+        };
+        items
+            .keys()
+            .map(|key| resolve.name_world_key(key))
+            .collect()
+    }
+
+    #[test]
+    fn one_interface_may_be_imported_under_several_explicit_names() {
+        let bytes = build(&Factory {
+            wit: WIT,
+            declare: |world, package| {
+                world.add_imports(package.interface("greeter")?.named("a")?)?;
+                world.add_imports(package.interface("greeter")?.named("b")?)?;
+                world.add_exports(package.interface("greeter")?)
+            },
+            body: |function, imports| {
+                let forwarded = imports
+                    .interface("a")?
+                    .function("greet")?
+                    .call(&[])?
+                    .expect("greet returns a string");
+                imports.interface("b")?.function("greet")?.call(&[])?;
+                function
+                    .result()
+                    .expect("greet returns a string")
+                    .value()
+                    .write(&ValueSpec::from(forwarded))
+            },
+        })
+        .expect("build");
+        validate(&bytes);
+        assert_eq!(world_names(&bytes, true), ["a", "b"]);
+        assert_eq!(world_names(&bytes, false), ["test:factory/greeter"]);
+    }
+
+    #[test]
+    fn an_import_reports_its_name() {
+        let bytes = build(&Factory {
+            wit: WIT,
+            declare: |world, package| {
+                world.add_imports(package.interface("logger")?)?;
+                world.add_imports(package.interface("greeter")?.named("hi")?)?;
+                world.add_exports(package.interface("greeter")?)
+            },
+            body: |function, imports| {
+                let names: Vec<String> = imports
+                    .interfaces()
+                    .iter()
+                    .map(|interface| interface.import_name())
+                    .collect();
+                assert_eq!(names, ["test:factory/logger", "hi"]);
+                function
+                    .result()
+                    .expect("greet returns a string")
+                    .value()
+                    .write(&ValueSpec::string("hello"))
+            },
+        })
+        .expect("build");
+        validate(&bytes);
+    }
+
+    #[test]
+    fn an_export_may_have_an_explicit_name() {
+        let bytes = build(&Factory {
+            wit: WIT,
+            declare: |world, package| world.add_exports(package.interface("greeter")?.named("hi")?),
+            body: |function, _| {
+                function
+                    .result()
+                    .expect("greet returns a string")
+                    .value()
+                    .write(&ValueSpec::string("hello"))
+            },
+        })
+        .expect("build");
+        validate(&bytes);
+        assert_eq!(world_names(&bytes, false), ["hi"]);
+    }
+
+    #[test]
+    fn a_source_world_keeps_its_explicit_names() {
+        let bytes = build(&Factory {
+            wit: r"package test:named;
+                   interface greeter { greet: func() -> string; }
+                   world target {
+                     export first: greeter;
+                     export second: greeter;
+                   }",
+            declare: |world, package| world.add_exports(package.world("target")?.exports()),
+            body: |function, _| {
+                function
+                    .result()
+                    .expect("greet returns a string")
+                    .value()
+                    .write(&ValueSpec::string("hello"))
+            },
+        })
+        .expect("build");
+        validate(&bytes);
+        assert_eq!(world_names(&bytes, false), ["first", "second"]);
     }
 
     #[test]
