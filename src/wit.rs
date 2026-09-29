@@ -1,7 +1,7 @@
 //! WIT support for factory implementations.
 
 use anyhow::{Result, anyhow, bail};
-use wit_parser::{InterfaceId, Resolve, WorldItem};
+use wit_parser::{InterfaceId, Resolve, WorldItem, WorldKey};
 
 /// Types of WIT source for use within a factory.
 pub enum WitSource {
@@ -90,12 +90,12 @@ impl WorldSource {
 
     /// Everything this world exports.
     pub fn exports(&self) -> Selection<'_> {
-        self.by_role(self.resolve.worlds[self.world].exports.values())
+        self.by_role(self.resolve.worlds[self.world].exports.iter())
     }
 
     /// Everything this world imports.
     pub fn imports(&self) -> Selection<'_> {
-        self.by_role(self.resolve.worlds[self.world].imports.values())
+        self.by_role(self.resolve.worlds[self.world].imports.iter())
     }
 
     /// One interface by short name or qualified `pkg:ns/name`, from either role.
@@ -130,12 +130,22 @@ impl WorldSource {
         world.imports.values().chain(world.exports.values())
     }
 
-    // Everything in one role, as a selection.
-    fn by_role<'a>(&'a self, items: impl Iterator<Item = &'a WorldItem>) -> Selection<'a> {
+    // Everything in one role, as a selection. A named or inline interface
+    // keeps its explicit name.
+    fn by_role<'a>(
+        &'a self,
+        items: impl Iterator<Item = (&'a WorldKey, &'a WorldItem)>,
+    ) -> Selection<'a> {
         let mut selection = Selection::empty(&self.resolve);
-        for item in items {
+        for (key, item) in items {
             match item {
-                WorldItem::Interface { id, .. } => selection.interfaces.push(*id),
+                WorldItem::Interface { id, .. } => {
+                    let explicit_name = match key {
+                        WorldKey::Name(name) => Some(name.clone()),
+                        WorldKey::Interface(_) => None,
+                    };
+                    selection.interfaces.push((explicit_name, *id));
+                }
                 WorldItem::Function(func) => {
                     selection.functions.push(func.name.clone());
                     // A world-level function is rooted in the world that
@@ -175,7 +185,8 @@ fn find_one(
 /// An item selected to be included in the world being built.
 pub struct Selection<'s> {
     pub(crate) resolve: &'s Resolve,
-    pub(crate) interfaces: Vec<InterfaceId>,
+    /// Each selected interface, with its explicit name if it has one.
+    pub(crate) interfaces: Vec<(Option<String>, InterfaceId)>,
     pub(crate) functions: Vec<String>,
     /// The world that owns the selected functions. Absent when only interfaces
     /// were selected.
@@ -195,10 +206,20 @@ impl<'s> Selection<'s> {
     fn of_interface(resolve: &'s Resolve, id: InterfaceId) -> Self {
         Selection {
             resolve,
-            interfaces: vec![id],
+            interfaces: vec![(None, id)],
             functions: Vec::new(),
             world: None,
         }
+    }
+
+    /// Give this selection's single interface an explicit name, e.g.
+    /// `import name: namespace:package/interface;`.
+    pub fn named(mut self, name: &str) -> Result<Self> {
+        if self.interfaces.len() != 1 || !self.functions.is_empty() {
+            bail!("only a single interface can be named");
+        }
+        self.interfaces[0].0 = Some(name.to_string());
+        Ok(self)
     }
 
     /// Whether nothing was selected.
@@ -442,5 +463,27 @@ mod tests {
         let package = PackageSource::from_text(PACKAGE).expect("parse");
         assert!(Selection::empty(&package.resolve).is_empty());
         assert!(!package.interface("greeter").expect("select").is_empty());
+    }
+
+    #[test]
+    fn only_a_single_interface_can_be_named() {
+        let world = PackageSource::from_text(PACKAGE)
+            .expect("parse")
+            .world("w")
+            .expect("world");
+        let Err(error) = world.exports().named("x") else {
+            panic!("an interface and a function cannot share a name");
+        };
+        assert!(
+            format!("{error:#}").contains("single interface"),
+            "{error:#}"
+        );
+        assert!(
+            world
+                .interface("greeter")
+                .expect("select")
+                .named("x")
+                .is_ok()
+        );
     }
 }

@@ -1861,7 +1861,7 @@ impl Imports {
     }
 
     /// An imported interface by name.
-    pub fn interface(&self, name: &str) -> Result<Interface> {
+    pub fn interface(&self, name: &str) -> Result<ImportedInterface> {
         let world = &self.ctx.resolve().worlds[self.ctx.world()];
         world
             .imports
@@ -1870,7 +1870,7 @@ impl Imports {
                 WorldItem::Interface { id, .. }
                     if interface_matches(self.ctx.resolve(), key, name) =>
                 {
-                    Some(Interface {
+                    Some(ImportedInterface {
                         ctx: Rc::clone(&self.ctx),
                         emitter: self.emitter.clone(),
                         key: key.clone(),
@@ -1883,12 +1883,12 @@ impl Imports {
     }
 
     /// Every imported interface, in declaration order.
-    pub fn interfaces(&self) -> Vec<Interface> {
+    pub fn interfaces(&self) -> Vec<ImportedInterface> {
         self.ctx.resolve().worlds[self.ctx.world()]
             .imports
             .iter()
             .filter_map(|(key, item)| match item {
-                WorldItem::Interface { id, .. } => Some(Interface {
+                WorldItem::Interface { id, .. } => Some(ImportedInterface {
                     ctx: Rc::clone(&self.ctx),
                     emitter: self.emitter.clone(),
                     key: key.clone(),
@@ -1914,7 +1914,7 @@ impl Imports {
     }
 
     /// Every function the world imports directly, in declaration order. An
-    /// interface's functions are reached through [`Interface::functions`].
+    /// interface's functions are reached through [`ImportedInterface::functions`].
     pub fn functions(&self) -> Result<Vec<ImportedFunction>> {
         self.ctx.resolve().worlds[self.ctx.world()]
             .imports
@@ -1945,17 +1945,28 @@ impl Imports {
 
 /// An imported interface.
 #[derive(Clone)]
-pub struct Interface {
+pub struct ImportedInterface {
     ctx: Rc<BuildContext>,
     emitter: Emitter,
     key: WorldKey,
     id: wit_parser::InterfaceId,
 }
 
-impl Interface {
+impl ImportedInterface {
     /// The interface's leaf name, absent if anonymous.
     pub fn name(&self) -> Option<&str> {
         self.ctx.resolve().interfaces[self.id].name.as_deref()
+    }
+
+    /// The interface's qualified name, absent if anonymous.
+    pub fn qualified_name(&self) -> Option<String> {
+        self.ctx.resolve().id_of(self.id)
+    }
+
+    /// The name of this import: its explicit name if declared, else the
+    /// interface's qualified name.
+    pub fn import_name(&self) -> String {
+        self.ctx.resolve().name_world_key(&self.key)
     }
 
     /// A function of this interface by name.
@@ -2193,6 +2204,32 @@ impl FunctionResult {
     }
 }
 
+/// An exported interface.
+#[derive(Clone)]
+pub struct ExportedInterface {
+    ctx: Rc<BuildContext>,
+    key: WorldKey,
+    id: wit_parser::InterfaceId,
+}
+
+impl ExportedInterface {
+    /// The interface's leaf name, absent if anonymous.
+    pub fn name(&self) -> Option<&str> {
+        self.ctx.resolve().interfaces[self.id].name.as_deref()
+    }
+
+    /// The interface's qualified name, absent if anonymous.
+    pub fn qualified_name(&self) -> Option<String> {
+        self.ctx.resolve().id_of(self.id)
+    }
+
+    /// The name of this export: its explicit name if declared, else the
+    /// interface's qualified name.
+    pub fn export_name(&self) -> String {
+        self.ctx.resolve().name_world_key(&self.key)
+    }
+}
+
 /// A function the generated component implements.
 #[derive(Clone)]
 pub struct ExportedFunction {
@@ -2246,12 +2283,26 @@ impl ExportedFunction {
         &self.func.name
     }
 
-    /// The fully qualified name of the interface this export belongs to, or
-    /// `None` for a world-level export.
-    pub fn qualified_interface_name(&self) -> Option<String> {
-        self.interface
-            .as_ref()
-            .map(|key| self.ctx.resolve().name_world_key(key))
+    /// The interface this function belongs to, or `None` for a world-level
+    /// function.
+    pub fn interface(&self) -> Option<ExportedInterface> {
+        let key = self.interface.as_ref()?;
+        let id = match key {
+            WorldKey::Interface(id) => *id,
+            // A named or inline interface export, keyed by its explicit name.
+            WorldKey::Name(_) => match self.ctx.resolve().worlds[self.ctx.world()]
+                .exports
+                .get(key)?
+            {
+                WorldItem::Interface { id, .. } => *id,
+                _ => return None,
+            },
+        };
+        Some(ExportedInterface {
+            ctx: Rc::clone(&self.ctx),
+            key: key.clone(),
+            id,
+        })
     }
 
     pub fn is_async(&self) -> bool {
@@ -4059,9 +4110,9 @@ mod tests {
     }
 
     #[test]
-    fn a_world_level_export_has_no_interface_name() {
+    fn a_world_level_export_has_no_interface() {
         let function = export(r"package test:direct; world w { export run: func(); }");
-        assert_eq!(function.qualified_interface_name(), None);
+        assert!(function.interface().is_none());
     }
 
     #[test]
@@ -4071,10 +4122,39 @@ mod tests {
               interface greeter { greet: func(); }
               world w { export greeter; }",
         );
-        let qualified = function
-            .qualified_interface_name()
-            .expect("a qualified name");
-        assert_eq!(qualified, "test:iface/greeter");
+        let interface = function.interface().expect("an interface");
+        assert_eq!(interface.name(), Some("greeter"));
+        assert_eq!(
+            interface.qualified_name().as_deref(),
+            Some("test:iface/greeter")
+        );
+        assert_eq!(interface.export_name(), "test:iface/greeter");
+    }
+
+    #[test]
+    fn a_named_export_reports_its_name_and_its_interface() {
+        let function = export(
+            r"package test:named;
+              interface greeter { greet: func(); }
+              world w { export first: greeter; }",
+        );
+        let interface = function.interface().expect("an interface");
+        assert_eq!(interface.export_name(), "first");
+        assert_eq!(
+            interface.qualified_name().as_deref(),
+            Some("test:named/greeter")
+        );
+    }
+
+    #[test]
+    fn an_inline_interface_export_has_a_name_but_no_qualified_name() {
+        let function = export(
+            r"package test:inline;
+              world w { export helper: interface { help: func(); } }",
+        );
+        let interface = function.interface().expect("an interface");
+        assert_eq!(interface.export_name(), "helper");
+        assert_eq!(interface.qualified_name(), None);
     }
 
     #[test]
