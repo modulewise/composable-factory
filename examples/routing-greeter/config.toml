@@ -1,0 +1,26 @@
+[component.routing-greeter]
+uri = "factory:routing-greeter-factory"
+imports = ["english", "australian", "spanish", "french"]
+
+[component.routing-greeter-factory]
+uri = "./lib/routing-greeter-factory.wasm"
+
+[component.routing-greeter-factory.config]
+"en-AU" = "australian"
+"es-*" = "spanish"
+"fr" = "french"
+
+[component.english]
+uri = "./lib/greeter.wasm"
+
+[component.australian]
+uri = "./lib/greeter.wasm"
+config.greeting = "g'day"
+
+[component.spanish]
+uri = "./lib/greeter.wasm"
+config.greeting = "hola"
+
+[component.french]
+uri = "./lib/greeter.wasm"
+config.greeting = "bonjour"

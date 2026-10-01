@@ -1050,6 +1050,170 @@ mod tests {
         validate(&bytes);
     }
 
+    const ROUTE_WIT: &str = r"package test:route;
+        world router { export route: func(name: string) -> string; }";
+
+    /// Declare the `route` export of [`ROUTE_WIT`].
+    fn route(world: &mut World, package: PackageSource) -> Result<()> {
+        world.add_exports(package.world("router")?.exports())
+    }
+
+    #[test]
+    fn exact_and_prefix_arms_build() {
+        let bytes = build(&Factory {
+            wit: ROUTE_WIT,
+            declare: route,
+            body: |function, _| {
+                let name = function.params()[0].receive()?;
+                let result = function.result().expect("route returns a string").value();
+                name.match_string(
+                    vec![
+                        crate::world::exact("forecast", || {
+                            result.write(&ValueSpec::string("exact"))
+                        }),
+                        crate::world::prefix("weather-", |rest| {
+                            result.write(&ValueSpec::from(rest))
+                        }),
+                    ],
+                    || result.write(&ValueSpec::string("none")),
+                )
+            },
+        })
+        .expect("a string match must build");
+        validate(&bytes);
+    }
+
+    /// One arm's literal, and whether it is matched exactly or as a prefix.
+    enum Literal {
+        Exact(&'static str),
+        Prefix(&'static str),
+    }
+
+    /// A `route` export that matches its name against `literals`, in order.
+    struct Router(&'static [Literal]);
+
+    impl ComponentBuilder for Router {
+        fn build_world(&self, world: &mut World) -> Result<()> {
+            route(world, PackageSource::from_text(ROUTE_WIT)?)
+        }
+
+        fn build_function(&self, function: &ExportedFunction, _: &Imports) -> Result<()> {
+            let name = function.params()[0].receive()?;
+            let result = &function.result().expect("route returns a string").value();
+            let matched = move || result.write(&ValueSpec::string("matched"));
+            let arms = self
+                .0
+                .iter()
+                .map(|literal| match literal {
+                    Literal::Exact(text) => crate::world::exact(*text, matched),
+                    Literal::Prefix(text) => crate::world::prefix(*text, move |_| matched()),
+                })
+                .collect();
+            name.match_string(arms, || result.write(&ValueSpec::string("none")))
+        }
+    }
+
+    #[test]
+    fn an_empty_exact_literal_builds() {
+        // It matches only the empty string, so it compares no bytes.
+        let bytes = build(&Router(&[Literal::Exact(""), Literal::Prefix("weather-")]))
+            .expect("an empty exact literal must build");
+        validate(&bytes);
+    }
+
+    #[test]
+    fn an_empty_prefix_is_rejected() {
+        let error = build(&Router(&[Literal::Exact("forecast"), Literal::Prefix("")]))
+            .expect_err("an empty prefix leaves otherwise unreachable");
+        assert!(format!("{error:#}").contains("empty prefix"), "{error:#}");
+    }
+
+    #[test]
+    fn an_exact_arm_shadowed_by_an_earlier_prefix_is_rejected() {
+        let error = build(&Router(&[
+            Literal::Prefix("weather-"),
+            Literal::Exact("weather-alerts"),
+        ]))
+        .expect_err("the prefix matches weather-alerts first");
+        assert!(
+            format!("{error:#}").contains(
+                r#"exact("weather-alerts") can never match, because prefix("weather-") comes before it"#
+            ),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_longer_prefix_after_a_shorter_one_is_rejected() {
+        let error = build(&Router(&[
+            Literal::Prefix("weather-"),
+            Literal::Prefix("weather-eu-"),
+        ]))
+        .expect_err("the shorter prefix matches everything the longer one does");
+        assert!(
+            format!("{error:#}").contains(r#"prefix("weather-eu-") can never match"#),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_repeated_exact_literal_is_rejected() {
+        let error = build(&Router(&[
+            Literal::Exact("forecast"),
+            Literal::Exact("forecast"),
+        ]))
+        .expect_err("the first arm matches forecast");
+        assert!(
+            format!("{error:#}").contains(r#"exact("forecast") can never match"#),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn arms_that_overlap_without_shadowing_build() {
+        // Each arm still matches a string no earlier arm does: `weather-`
+        // after the exact `weather-` matches `weather-alerts`, and the exact
+        // `weather` does not start with the prefix `weather-`.
+        let bytes = build(&Router(&[
+            Literal::Exact("weather-"),
+            Literal::Prefix("weather-"),
+            Literal::Exact("weather"),
+        ]))
+        .expect("arms that overlap but do not shadow each other must build");
+        validate(&bytes);
+    }
+
+    #[test]
+    fn a_match_without_arms_runs_otherwise() {
+        let bytes = build(&Factory {
+            wit: ROUTE_WIT,
+            declare: route,
+            body: |function, _| {
+                let name = function.params()[0].receive()?;
+                let result = function.result().expect("route returns a string").value();
+                name.match_string(Vec::new(), || result.write(&ValueSpec::string("none")))
+            },
+        })
+        .expect("a match without arms must build");
+        validate(&bytes);
+    }
+
+    #[test]
+    fn only_a_string_can_be_matched() {
+        let error = build(&Factory {
+            wit: r"package test:routenumber;
+                   world router { export route: func(n: u32) -> string; }",
+            declare: route,
+            body: |function, _| {
+                let number = function.params()[0].receive()?;
+                let result = function.result().expect("route returns a string").value();
+                number.match_string(Vec::new(), || result.write(&ValueSpec::string("none")))
+            },
+        })
+        .expect_err("a u32 cannot be matched against strings");
+        assert!(format!("{error:#}").contains("not a string"), "{error:#}");
+    }
+
     #[test]
     fn a_received_value_copies_into_a_flat_record_field() {
         // A received param is a source, so writing it into a field copies its

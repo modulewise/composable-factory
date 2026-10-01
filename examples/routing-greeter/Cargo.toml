@@ -1,0 +1,12 @@
+[package]
+name = "routing-greeter-factory"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow.workspace = true
+composable-factory.workspace = true
+wit-bindgen.workspace = true

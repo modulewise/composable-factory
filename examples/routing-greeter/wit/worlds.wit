@@ -1,0 +1,13 @@
+/// Generates a routing greeter, with routes from config.
+world routing-greeter-factory {
+    import wasi:config/store@0.2.0-rc.1;
+
+    export composable:factory/factory@0.4.0;
+}
+
+/// Greets with the greeting from config.
+world language-greeter {
+    import wasi:config/store@0.2.0-rc.1;
+
+    export greeter;
+}

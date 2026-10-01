@@ -44,6 +44,8 @@ with a received "name" value.
 instructions directly.
 - [logging-interceptor](./examples/logging-interceptor): generates a component that mirrors a
 target component's exports, forwards to them as imports, and logs each call and return.
+- [routing-greeter](./examples/routing-greeter): generates a greeter that routes each call, by
+locale, to the greeter configured for it, matching the locale exactly or as a prefix.
 
 Each has a `run.sh` that builds the factory, generates a component with the factory, and then
 invokes the generated component.
