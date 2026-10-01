@@ -726,8 +726,9 @@ impl Value {
             })
         })?;
 
-        // Copy the length into a new local: `length` may be the input list's
-        // length local, which code after the map could overwrite.
+        // Copy the length into a new local, because when the input list is
+        // held in locals, `length` is one of those locals, and code after the
+        // map operation could overwrite it.
         let mapped_length = Local::new(self.local(ValType::I32), ValType::I32);
         self.emit(Instruction::LocalGet(length));
         self.emit(Instruction::LocalSet(mapped_length.index));
