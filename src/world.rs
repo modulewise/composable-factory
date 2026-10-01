@@ -2333,16 +2333,11 @@ impl ImportedFunction {
     /// Each argument must flatten to what its param expects: widening and
     /// narrowing are the caller's responsibility, through [`Value::coerce`].
     ///
-    /// Calling an async import is not yet supported.
+    /// An async import is called synchronously. The call will block the
+    /// calling task if the result is not returned immediately. Only an async
+    /// export's task may block, so from a sync export the task traps if the
+    /// call blocks, which depends on the import's implementation.
     pub fn call(&self, args: &[Value]) -> Result<Option<Value>> {
-        if self.func.kind.is_async() {
-            bail!(
-                "call: '{}' is an async import, which is not yet supported; an async call \
-                 returns a status code and fills its result in later, so its result cannot be \
-                 read where a sync one can",
-                self.func.name
-            );
-        }
         let resolve = self.ctx.resolve();
         let expected: Vec<Vec<ValType>> = self
             .func
