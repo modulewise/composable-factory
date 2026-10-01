@@ -1110,11 +1110,17 @@ impl<'a> Writer<'a> {
         let length = Local::new(self.emitter.local(ValType::I32), ValType::I32);
         self.emit(Instruction::I32Const(0));
         self.emit(Instruction::LocalSet(length.index));
-        // Each part resolved once, so the copy below reads the same locals the
-        // sum did.
-        let mut resolved = Vec::with_capacity(parts.len());
+        // A copied part's elements are located once, so the copy below reads
+        // the same locals the sum did.
+        let mut parts_to_join = Vec::with_capacity(parts.len());
         for part in parts {
-            let part = self.resolve_part(part)?;
+            let part = match part {
+                ValueSpec::List(items) => Part::Written(items),
+                _ => {
+                    let (pointer, length) = self.locate_elements(part)?;
+                    Part::Copied { pointer, length }
+                }
+            };
             let count = match &part {
                 Part::Copied { length, .. } => Instruction::LocalGet(*length),
                 Part::Written([]) => continue,
@@ -1124,7 +1130,7 @@ impl<'a> Writer<'a> {
             self.emit(count);
             self.emit(Instruction::I32Add);
             self.emit(Instruction::LocalSet(length.index));
-            resolved.push(part);
+            parts_to_join.push(part);
         }
 
         let pointer = Local::new(self.emitter.local(ValType::I32), ValType::I32);
@@ -1141,7 +1147,7 @@ impl<'a> Writer<'a> {
         let cursor = self.emitter.local(ValType::I32);
         self.emit(Instruction::LocalGet(pointer.index));
         self.emit(Instruction::LocalSet(cursor));
-        for part in resolved {
+        for part in parts_to_join {
             match part {
                 Part::Copied {
                     pointer: part_pointer,
@@ -1159,7 +1165,8 @@ impl<'a> Writer<'a> {
                     self.emit(Instruction::LocalGet(bytes));
                 }
                 Part::Written(items) => {
-                    let element = element.expect("check_part admits items only into a list");
+                    let element = element
+                        .expect("check_part accepts a list part only for a list destination");
                     for (index, item) in items.iter().enumerate() {
                         self.write(
                             element,
@@ -1274,10 +1281,10 @@ impl<'a> Writer<'a> {
         }
     }
 
-    /// One pre-checked concat part, ready to be summed and joined.
-    fn resolve_part<'p>(&self, part: &'p ValueSpec) -> Result<Part<'p>> {
+    /// The locals holding a part's pointer and element count, for a part
+    /// whose elements are already in memory: an interned literal or a source.
+    fn locate_elements(&self, part: &ValueSpec) -> Result<(u32, u32)> {
         let interned = match part {
-            ValueSpec::List(items) => return Ok(Part::Written(items)),
             ValueSpec::Leaf(Leaf::Str(text)) => Some(self.ctx.intern(text.as_bytes())),
             ValueSpec::Leaf(Leaf::Bytes(bytes)) => Some(self.ctx.intern(bytes)),
             _ => None,
@@ -1289,13 +1296,12 @@ impl<'a> Writer<'a> {
             self.emit(Instruction::LocalSet(pointer));
             self.emit(Instruction::I32Const(len as i32));
             self.emit(Instruction::LocalSet(length));
-            return Ok(Part::Copied { pointer, length });
+            return Ok((pointer, length));
         }
         let ValueSpec::Leaf(Leaf::Source(source)) = part else {
-            unreachable!("check_part accepts only lists, literals and sources");
+            unreachable!("lists and literals are handled before here, so this is a source");
         };
-        let (pointer, length) = load_ptr_len(self.emitter, &source.slot)?;
-        Ok(Part::Copied { pointer, length })
+        load_ptr_len(self.emitter, &source.slot)
     }
 
     /// Reserve `bytes` of heap and return the local holding the pointer.
@@ -3407,18 +3413,25 @@ mod tests {
         );
     }
 
-    /// The type `name` declared in `interface`, or the result type of its
-    /// function `name` if no type has that name.
-    fn type_in(resolve: &Resolve, interface: &str, name: &str) -> wit_parser::Type {
-        let (_, declared) = resolve
+    /// The interface named `name`.
+    fn interface<'r>(resolve: &'r Resolve, name: &str) -> &'r wit_parser::Interface {
+        resolve
             .interfaces
             .iter()
-            .find(|(_, declared)| declared.name.as_deref() == Some(interface))
-            .expect("the interface");
-        match declared.types.get(name) {
-            Some(id) => wit_parser::Type::Id(*id),
-            None => declared.functions[name].result.expect("a result"),
-        }
+            .find_map(|(_, declared)| (declared.name.as_deref() == Some(name)).then_some(declared))
+            .expect("the interface")
+    }
+
+    /// The type `name` declared in `interface`.
+    fn declared_type(resolve: &Resolve, interface: &str, name: &str) -> wit_parser::Type {
+        wit_parser::Type::Id(self::interface(resolve, interface).types[name])
+    }
+
+    /// The result type of `function` in `interface`.
+    fn result_type(resolve: &Resolve, interface: &str, function: &str) -> wit_parser::Type {
+        self::interface(resolve, interface).functions[function]
+            .result
+            .expect("a result")
     }
 
     const EQUALITY_WIT: &str = r"package test:equality;
@@ -3451,53 +3464,56 @@ mod tests {
     fn a_type_reached_through_two_aliases_is_equal() {
         let resolve = equality();
         let (a, b) = (
-            type_in(&resolve, "a", "entry"),
-            type_in(&resolve, "b", "entry"),
+            declared_type(&resolve, "a", "entry"),
+            declared_type(&resolve, "b", "entry"),
         );
         assert_ne!(a, b, "each interface's `use` is its own alias");
         assert!(types_equal(&resolve, a, b));
     }
 
     #[test]
-    fn anonymous_types_over_two_aliases_are_equal() {
+    fn anonymous_types_using_two_aliases_are_equal() {
         let resolve = equality();
         let (a, b) = (
-            type_in(&resolve, "a", "entries"),
-            type_in(&resolve, "b", "entries"),
+            result_type(&resolve, "a", "entries"),
+            result_type(&resolve, "b", "entries"),
         );
-        assert_ne!(a, b, "each `list<entry>` is interned over its own alias");
+        assert_ne!(
+            a, b,
+            "each `list<entry>` refers to its own interface's `entry` alias"
+        );
         assert!(types_equal(&resolve, a, b));
     }
 
     #[test]
     fn record_names_are_ignored_but_field_names_are_not() {
         let resolve = equality();
-        let entry = type_in(&resolve, "types", "entry");
+        let entry = declared_type(&resolve, "types", "entry");
         assert!(types_equal(
             &resolve,
             entry,
-            type_in(&resolve, "types", "renamed")
+            declared_type(&resolve, "types", "renamed")
         ));
         assert!(!types_equal(
             &resolve,
             entry,
-            type_in(&resolve, "types", "other")
+            declared_type(&resolve, "types", "other")
         ));
     }
 
     #[test]
     fn handles_are_equal_only_for_the_same_resource() {
         let resolve = equality();
-        let first = type_in(&resolve, "a", "own-first");
+        let first = result_type(&resolve, "a", "own-first");
         assert!(types_equal(
             &resolve,
             first,
-            type_in(&resolve, "b", "own-first")
+            result_type(&resolve, "b", "own-first")
         ));
         assert!(!types_equal(
             &resolve,
             first,
-            type_in(&resolve, "b", "own-second")
+            result_type(&resolve, "b", "own-second")
         ));
     }
 
