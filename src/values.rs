@@ -218,7 +218,7 @@ pub enum Leaf {
     F32(f32),
     F64(f64),
     Char(char),
-    /// Parts joined into one `string` or `list<u8>`, allocated and copied at
+    /// Parts joined into one `string` or `list<T>`, allocated and filled at
     /// runtime.
     Concat(Vec<ValueSpec>),
     /// Content an already-materialized value supplies, emitted as a copy.
@@ -403,9 +403,10 @@ impl ValueSpec {
         ValueSpec::Leaf(Leaf::Source(source))
     }
 
-    /// Parts joined into one `string` or `list<u8>`, based on the destination
-    /// type. Adjacent literals are joined here, so if all parts are literals,
-    /// they become a single interned entry.
+    /// Parts joined into one `string` or `list<T>`, based on the destination
+    /// type. Each part is a string, a list, or a source of one; a single
+    /// element joins as a one-element list. Adjacent literals are joined here,
+    /// so if all parts are literals, they become a single literal.
     pub fn concat(parts: impl IntoIterator<Item = impl Into<ValueSpec>>) -> ValueSpec {
         let mut joined: Vec<ValueSpec> = Vec::new();
         for part in parts {
@@ -422,6 +423,7 @@ impl ValueSpec {
                         Some(ValueSpec::Leaf(Leaf::Bytes(bytes))),
                         ValueSpec::Leaf(Leaf::Bytes(next)),
                     ) => bytes.extend_from_slice(&next),
+                    (Some(ValueSpec::List(items)), ValueSpec::List(next)) => items.extend(next),
                     (_, part) => joined.push(part),
                 }
             }
@@ -429,7 +431,9 @@ impl ValueSpec {
         if joined.len() == 1
             && matches!(
                 joined[0],
-                ValueSpec::Leaf(Leaf::Str(_)) | ValueSpec::Leaf(Leaf::Bytes(_))
+                ValueSpec::Leaf(Leaf::Str(_))
+                    | ValueSpec::Leaf(Leaf::Bytes(_))
+                    | ValueSpec::List(_)
             )
         {
             return joined.pop().expect("one part");
@@ -907,8 +911,9 @@ impl<'a> Writer<'a> {
             }
             TypeDefKind::List(elem) => {
                 let elem = *elem;
-                // A `list<u8>` literal is interned as a unit (like a string)
-                // rather than iterating its elements.
+                // A `list<u8>` literal is interned as a unit (like a string),
+                // and a concat fills an allocation of its own, so neither
+                // iterates elements here.
                 if matches!(value, ValueSpec::Leaf(Leaf::Bytes(_) | Leaf::Concat(_))) {
                     return match slot {
                         Slot::Flat { locals } => {
@@ -1078,35 +1083,54 @@ impl<'a> Writer<'a> {
         }
     }
 
-    /// Join string parts into one allocation and write its `{ptr, len}` pair.
+    /// Join parts into one `string` or `list<T>` allocation and write its
+    /// `{ptr, len}` pair.
     ///
     /// A source part's length is only known at runtime, so the total is summed
-    /// into a local and each part is copied at an incrementing offset.
+    /// into a local. Each part is then copied, or its elements written, at an
+    /// incrementing offset.
     fn write_concat(&self, ty: wit_parser::Type, slot: &Slot, parts: &[ValueSpec]) -> Result<()> {
-        if !is_byte_sequence(self.ctx.resolve(), ty) {
-            bail!(
-                "a concat value can only be written to a string or list<u8> position, not {ty:?}"
-            );
-        }
-        // A string destination must contain valid UTF-8, which constrains its
-        // parts. A `list<u8>` destination accepts any byte sequence.
-        let text_only = is_string(self.ctx.resolve(), ty);
+        let resolve = self.ctx.resolve();
+        // `None` for a string, which is a sequence of bytes that must be valid
+        // UTF-8, so it has no element type to write.
+        let element = match follow_aliases(resolve, ty) {
+            wit_parser::Type::String => None,
+            wit_parser::Type::Id(id) if let TypeDefKind::List(element) = resolve.types[id].kind => {
+                Some(element)
+            }
+            _ => {
+                bail!("a concat value can only be written to a string or list position, not {ty:?}")
+            }
+        };
+        let stride = element.map_or(1, |element| self.ctx.layout().size(&element));
         for part in parts {
-            self.check_part(part, text_only)?;
+            self.check_part(part, element)?;
         }
+
         let length = Local::new(self.emitter.local(ValType::I32), ValType::I32);
         self.emit(Instruction::I32Const(0));
         self.emit(Instruction::LocalSet(length.index));
-        // Each part's `{ptr, len}`, resolved once so the copy loop below reads
+        // A copied part's elements are located once, so the copy below reads
         // the same locals the sum did.
-        let mut resolved = Vec::with_capacity(parts.len());
+        let mut parts_to_join = Vec::with_capacity(parts.len());
         for part in parts {
-            let (pointer, part_len) = self.part_ptr_len(part)?;
+            let part = match part {
+                ValueSpec::List(items) => Part::Written(items),
+                _ => {
+                    let (pointer, length) = self.locate_elements(part)?;
+                    Part::Copied { pointer, length }
+                }
+            };
+            let count = match &part {
+                Part::Copied { length, .. } => Instruction::LocalGet(*length),
+                Part::Written([]) => continue,
+                Part::Written(items) => Instruction::I32Const(items.len() as i32),
+            };
             self.emit(Instruction::LocalGet(length.index));
-            self.emit(Instruction::LocalGet(part_len));
+            self.emit(count);
             self.emit(Instruction::I32Add);
             self.emit(Instruction::LocalSet(length.index));
-            resolved.push((pointer, part_len));
+            parts_to_join.push(part);
         }
 
         let pointer = Local::new(self.emitter.local(ValType::I32), ValType::I32);
@@ -1115,7 +1139,7 @@ impl<'a> Writer<'a> {
             self.emitter,
             Size::Strided {
                 count: length,
-                stride: 1,
+                stride,
             },
         );
         self.emit(Instruction::LocalSet(pointer.index));
@@ -1123,20 +1147,58 @@ impl<'a> Writer<'a> {
         let cursor = self.emitter.local(ValType::I32);
         self.emit(Instruction::LocalGet(pointer.index));
         self.emit(Instruction::LocalSet(cursor));
-        for (part_ptr, part_len) in resolved {
-            self.emit(Instruction::LocalGet(cursor));
-            self.emit(Instruction::LocalGet(part_ptr));
-            self.emit(Instruction::LocalGet(part_len));
-            self.emit(Instruction::MemoryCopy {
-                src_mem: 0,
-                dst_mem: 0,
-            });
-            self.emit(Instruction::LocalGet(cursor));
-            self.emit(Instruction::LocalGet(part_len));
+        for part in parts_to_join {
+            match part {
+                Part::Copied {
+                    pointer: part_pointer,
+                    length: part_length,
+                } => {
+                    let bytes = self.byte_count(part_length, stride);
+                    self.emit(Instruction::LocalGet(cursor));
+                    self.emit(Instruction::LocalGet(part_pointer));
+                    self.emit(Instruction::LocalGet(bytes));
+                    self.emit(Instruction::MemoryCopy {
+                        src_mem: 0,
+                        dst_mem: 0,
+                    });
+                    self.emit(Instruction::LocalGet(cursor));
+                    self.emit(Instruction::LocalGet(bytes));
+                }
+                Part::Written(items) => {
+                    let element = element
+                        .expect("check_part accepts a list part only for a list destination");
+                    for (index, item) in items.iter().enumerate() {
+                        self.write(
+                            element,
+                            &Slot::Memory {
+                                base: cursor,
+                                offset: index * stride,
+                            },
+                            item,
+                        )
+                        .with_context(|| format!("in element [{index}]"))?;
+                    }
+                    self.emit(Instruction::LocalGet(cursor));
+                    self.emit(Instruction::I32Const((items.len() * stride) as i32));
+                }
+            }
             self.emit(Instruction::I32Add);
             self.emit(Instruction::LocalSet(cursor));
         }
         self.write_ptr_len(slot, pointer, Len::In(length))
+    }
+
+    /// A local holding `count * stride`, or `count` itself for a stride of 1.
+    fn byte_count(&self, count: u32, stride: usize) -> u32 {
+        if stride == 1 {
+            return count;
+        }
+        let bytes = self.emitter.local(ValType::I32);
+        self.emit(Instruction::LocalGet(count));
+        self.emit(Instruction::I32Const(stride as i32));
+        self.emit(Instruction::I32Mul);
+        self.emit(Instruction::LocalSet(bytes));
+        bytes
     }
 
     /// Intern `bytes` and set a `{ptr, len}` pair of locals with its location.
@@ -1159,49 +1221,69 @@ impl<'a> Writer<'a> {
         self.store_const_i32(base, offset + 4, len as i32)
     }
 
-    /// Whether `part` can contribute to a concat. `text_only` indicates the
-    /// destination must contain valid UTF-8, which byte parts can satisfy only
-    /// when they are inspectable at build time (literals, not sources).
-    fn check_part(&self, part: &ValueSpec, text_only: bool) -> Result<()> {
-        let ValueSpec::Leaf(leaf) = part else {
-            bail!("a concat part must be a string or list<u8> value");
-        };
-        match leaf {
-            Leaf::Str(_) => Ok(()),
-            Leaf::Bytes(bytes) if text_only => match std::str::from_utf8(bytes) {
-                Ok(_) => Ok(()),
-                Err(error) => {
-                    bail!("a list<u8> part joining a string must be valid UTF-8: {error}")
+    /// Whether `part` can contribute to a concat whose destination has
+    /// `element` type, or is a string when `None`.
+    ///
+    /// A byte part (a string or `list<u8>`) joins a string or `list<u8>`
+    /// destination. A string destination must contain valid UTF-8, which byte
+    /// parts can satisfy only when they are inspectable at build time
+    /// (literals, not sources). Any other list destination takes lists of its
+    /// element type.
+    fn check_part(&self, part: &ValueSpec, element: Option<wit_parser::Type>) -> Result<()> {
+        let resolve = self.ctx.resolve();
+        let takes_bytes =
+            element.is_none_or(|element| follow_aliases(resolve, element) == wit_parser::Type::U8);
+        match part {
+            ValueSpec::List(_) if element.is_some() => Ok(()),
+            ValueSpec::List(_) => bail!("a list part cannot join a string"),
+            ValueSpec::Leaf(Leaf::Str(_)) if takes_bytes => Ok(()),
+            ValueSpec::Leaf(Leaf::Bytes(bytes)) if element.is_none() => {
+                match std::str::from_utf8(bytes) {
+                    Ok(_) => Ok(()),
+                    Err(error) => {
+                        bail!("a list<u8> part joining a string must be valid UTF-8: {error}")
+                    }
                 }
-            },
-            Leaf::Bytes(_) => Ok(()),
-            Leaf::Source(source) => {
-                let resolve = self.ctx.resolve();
-                if !is_byte_sequence(resolve, source.ty) {
-                    bail!(
-                        "a concat part must be a string or list<u8>, got {:?}",
-                        source.ty
-                    );
-                }
-                if text_only && !is_string(resolve, source.ty) {
-                    bail!(
-                        "a {:?} value's bytes are unknown at build time, so they \
-                         cannot join a string, which must be valid UTF-8",
-                        source.ty
-                    );
-                }
-                Ok(())
             }
-            other => bail!(
-                "a concat part must be a string or list<u8>, got a {} literal \
+            ValueSpec::Leaf(Leaf::Bytes(_)) if takes_bytes => Ok(()),
+            ValueSpec::Leaf(Leaf::Source(source)) => match element {
+                None if is_string(resolve, source.ty) => Ok(()),
+                None if is_byte_sequence(resolve, source.ty) => bail!(
+                    "a {:?} value's bytes are unknown at build time, so they \
+                     cannot join a string, which must be valid UTF-8",
+                    source.ty
+                ),
+                Some(_) if takes_bytes && is_byte_sequence(resolve, source.ty) => Ok(()),
+                Some(element) if self.is_list_of(source.ty, element) => Ok(()),
+                _ => bail!(
+                    "a concat part of type {:?} does not match the destination",
+                    source.ty
+                ),
+            },
+            ValueSpec::Leaf(leaf) => bail!(
+                "a concat part must be a string or list, got a {} literal \
                  (convert it with `format!` or an imported function)",
-                leaf_kind_name(other)
+                leaf_kind_name(leaf)
             ),
+            _ => bail!("a concat part must be a string or list value"),
         }
     }
 
-    /// One pre-checked concat part's pointer and length, as locals.
-    fn part_ptr_len(&self, part: &ValueSpec) -> Result<(u32, u32)> {
+    /// Whether `ty` is a list whose elements are of type `element`.
+    fn is_list_of(&self, ty: wit_parser::Type, element: wit_parser::Type) -> bool {
+        let resolve = self.ctx.resolve();
+        match follow_aliases(resolve, ty) {
+            wit_parser::Type::Id(id) => match resolve.types[id].kind {
+                TypeDefKind::List(actual) => types_equal(resolve, actual, element),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// The locals holding a part's pointer and element count, for a part
+    /// whose elements are already in memory: an interned literal or a source.
+    fn locate_elements(&self, part: &ValueSpec) -> Result<(u32, u32)> {
         let interned = match part {
             ValueSpec::Leaf(Leaf::Str(text)) => Some(self.ctx.intern(text.as_bytes())),
             ValueSpec::Leaf(Leaf::Bytes(bytes)) => Some(self.ctx.intern(bytes)),
@@ -1217,7 +1299,7 @@ impl<'a> Writer<'a> {
             return Ok((pointer, length));
         }
         let ValueSpec::Leaf(Leaf::Source(source)) = part else {
-            unreachable!("check_part accepts only literals and sources");
+            unreachable!("lists and literals are handled before here, so this is a source");
         };
         load_ptr_len(self.emitter, &source.slot)
     }
@@ -1488,6 +1570,15 @@ impl<'a> Writer<'a> {
     }
 }
 
+/// One part of a concat, and how it fills the joined allocation.
+enum Part<'p> {
+    /// Elements already in memory, copied: an interned literal or a source,
+    /// with its pointer and element count in locals.
+    Copied { pointer: u32, length: u32 },
+    /// Elements written one by one from their specs.
+    Written(&'p [ValueSpec]),
+}
+
 /// The alignment every allocation requests. 8 satisfies every wasm32 WIT type.
 const ALIGN: i32 = 8;
 
@@ -1591,8 +1682,91 @@ fn is_string(resolve: &Resolve, ty: wit_parser::Type) -> bool {
     }
 }
 
-/// Whether `ty` is `string` or `list<u8>` (the types a concat produces), both
-/// represented as `{ptr, len}` over bytes. Aliases are followed.
+/// The type at the end of a chain of aliases, or `ty` if it is not an alias.
+fn follow_aliases(resolve: &Resolve, ty: wit_parser::Type) -> wit_parser::Type {
+    match ty {
+        wit_parser::Type::Id(id) => match &resolve.types[id].kind {
+            TypeDefKind::Type(inner) => follow_aliases(resolve, *inner),
+            _ => ty,
+        },
+        _ => ty,
+    }
+}
+
+/// Whether `a` and `b` are the same type under the component model's type
+/// equality: structural, with aliases resolved and type names ignored. Only a
+/// handle's resource is compared by identity.
+fn types_equal(resolve: &Resolve, a: wit_parser::Type, b: wit_parser::Type) -> bool {
+    let (a, b) = (follow_aliases(resolve, a), follow_aliases(resolve, b));
+    let (wit_parser::Type::Id(a), wit_parser::Type::Id(b)) = (a, b) else {
+        return a == b;
+    };
+    if a == b {
+        return true;
+    }
+    let equal = |a, b| types_equal(resolve, a, b);
+    let equal_optional = |a: Option<_>, b: Option<_>| match (a, b) {
+        (Some(a), Some(b)) => equal(a, b),
+        (None, None) => true,
+        _ => false,
+    };
+    match (&resolve.types[a].kind, &resolve.types[b].kind) {
+        (TypeDefKind::Record(a), TypeDefKind::Record(b)) => {
+            a.fields.len() == b.fields.len()
+                && a.fields
+                    .iter()
+                    .zip(&b.fields)
+                    .all(|(a, b)| a.name == b.name && equal(a.ty, b.ty))
+        }
+        (TypeDefKind::Variant(a), TypeDefKind::Variant(b)) => {
+            a.cases.len() == b.cases.len()
+                && a.cases
+                    .iter()
+                    .zip(&b.cases)
+                    .all(|(a, b)| a.name == b.name && equal_optional(a.ty, b.ty))
+        }
+        (TypeDefKind::Enum(a), TypeDefKind::Enum(b)) => a
+            .cases
+            .iter()
+            .map(|case| &case.name)
+            .eq(b.cases.iter().map(|case| &case.name)),
+        (TypeDefKind::Flags(a), TypeDefKind::Flags(b)) => a
+            .flags
+            .iter()
+            .map(|flag| &flag.name)
+            .eq(b.flags.iter().map(|flag| &flag.name)),
+        (TypeDefKind::Tuple(a), TypeDefKind::Tuple(b)) => {
+            a.types.len() == b.types.len()
+                && a.types.iter().zip(&b.types).all(|(a, b)| equal(*a, *b))
+        }
+        (TypeDefKind::List(a), TypeDefKind::List(b))
+        | (TypeDefKind::Option(a), TypeDefKind::Option(b)) => equal(*a, *b),
+        (TypeDefKind::FixedLengthList(a, n), TypeDefKind::FixedLengthList(b, m)) => {
+            n == m && equal(*a, *b)
+        }
+        (TypeDefKind::Map(ak, av), TypeDefKind::Map(bk, bv)) => equal(*ak, *bk) && equal(*av, *bv),
+        (TypeDefKind::Result(a), TypeDefKind::Result(b)) => {
+            equal_optional(a.ok, b.ok) && equal_optional(a.err, b.err)
+        }
+        (TypeDefKind::Future(a), TypeDefKind::Future(b))
+        | (TypeDefKind::Stream(a), TypeDefKind::Stream(b)) => equal_optional(*a, *b),
+        (
+            TypeDefKind::Handle(wit_parser::Handle::Own(a)),
+            TypeDefKind::Handle(wit_parser::Handle::Own(b)),
+        )
+        | (
+            TypeDefKind::Handle(wit_parser::Handle::Borrow(a)),
+            TypeDefKind::Handle(wit_parser::Handle::Borrow(b)),
+        ) => {
+            follow_aliases(resolve, wit_parser::Type::Id(*a))
+                == follow_aliases(resolve, wit_parser::Type::Id(*b))
+        }
+        _ => false,
+    }
+}
+
+/// Whether `ty` is `string` or `list<u8>`, both represented as `{ptr, len}`
+/// over bytes. Aliases are followed.
 fn is_byte_sequence(resolve: &Resolve, ty: wit_parser::Type) -> bool {
     match ty {
         wit_parser::Type::String => true,
@@ -3099,6 +3273,248 @@ mod tests {
         Writer::new(&ctx, &emitter)
             .write(ty, &Slot::at(0), &spec)
             .expect("valid UTF-8 bytes join a string");
+    }
+
+    const LIST_WIT: &str = r"package test:concatlist;
+        interface i {
+          record entry { name: string }
+          type entries = list<entry>;
+          type names = list<string>;
+          type name = string;
+          f: func(e: entries, n: names);
+        }
+        world w { import i; }";
+
+    /// An entry literal, for the literal parts of a joined list.
+    fn entry(name: &str) -> ValueSpec {
+        ValueSpec::record([("name", ValueSpec::string(name))])
+    }
+
+    #[test]
+    fn joining_adjacent_literal_lists_makes_one_list() {
+        let spec = ValueSpec::concat([
+            ValueSpec::list([entry("a")]),
+            ValueSpec::list([entry("b"), entry("c")]),
+        ]);
+        let ValueSpec::List(items) = spec else {
+            panic!("expected a single literal list");
+        };
+        assert_eq!(items.len(), 3);
+    }
+
+    #[test]
+    fn a_literal_list_joined_to_a_list_source_is_allocated_and_filled() {
+        let ctx = context(LIST_WIT);
+        let ty = named_type(&ctx, "entries");
+        let emitter = Emitter::new(2);
+        let spec = ValueSpec::concat([
+            ValueSpec::list([entry("a"), entry("b")]),
+            ValueSpec::source(ValueRef {
+                ty,
+                slot: Slot::at(1),
+            }),
+        ]);
+        Writer::new(&ctx, &emitter)
+            .write(ty, &Slot::at(0), &spec)
+            .expect("write");
+        let function = emitter.encode().expect("encode");
+        validate_with_allocator(&ctx, function, vec![ValType::I32, ValType::I32], Vec::new());
+    }
+
+    #[test]
+    fn a_joined_list_is_written_into_locals() {
+        let ctx = context(LIST_WIT);
+        let ty = named_type(&ctx, "entries");
+        let emitter = Emitter::new(2);
+        let spec = ValueSpec::concat([
+            ValueSpec::source(ValueRef {
+                ty,
+                slot: Slot::at(1),
+            }),
+            ValueSpec::list([entry("a")]),
+        ]);
+        let destination = Slot::flat(vec![
+            Local::new(emitter.local(ValType::I32), ValType::I32),
+            Local::new(emitter.local(ValType::I32), ValType::I32),
+        ]);
+        Writer::new(&ctx, &emitter)
+            .write(ty, &destination, &spec)
+            .expect("write");
+        let function = emitter.encode().expect("encode");
+        validate_with_allocator(&ctx, function, vec![ValType::I32, ValType::I32], Vec::new());
+    }
+
+    #[test]
+    fn runtime_bytes_join_a_list_of_u8() {
+        // A list holding a byte known only at runtime is not a byte literal,
+        // so it joins as a list whose elements are written.
+        let ctx = context(BYTES_WIT);
+        let ty = named_type(&ctx, "blob");
+        let emitter = Emitter::new(1);
+        let byte = ValueSpec::source(ValueRef {
+            ty: wit_parser::Type::U8,
+            slot: Slot::flat(vec![Local::new(0, ValType::I32)]),
+        });
+        let spec = ValueSpec::concat([ValueSpec::bytes(vec![1]), ValueSpec::list([byte])]);
+        let destination = Slot::at(emitter.local(ValType::I32));
+        Writer::new(&ctx, &emitter)
+            .write(ty, &destination, &spec)
+            .expect("write");
+        let function = emitter.encode().expect("encode");
+        validate_with_allocator(&ctx, function, vec![ValType::I32], Vec::new());
+    }
+
+    #[test]
+    fn a_list_source_of_another_element_type_is_rejected() {
+        let ctx = context(LIST_WIT);
+        let emitter = Emitter::new(2);
+        let spec = ValueSpec::concat([
+            ValueSpec::list([entry("a")]),
+            ValueSpec::source(ValueRef {
+                ty: named_type(&ctx, "names"),
+                slot: Slot::at(1),
+            }),
+        ]);
+        let error = Writer::new(&ctx, &emitter)
+            .write(named_type(&ctx, "entries"), &Slot::at(0), &spec)
+            .expect_err("a list<string> does not join a list<entry>");
+        assert!(format!("{error:#}").contains("does not match"), "{error:#}");
+    }
+
+    #[test]
+    fn a_literal_list_element_of_another_type_is_rejected() {
+        let ctx = context(LIST_WIT);
+        let emitter = Emitter::new(1);
+        let spec = ValueSpec::concat([ValueSpec::list([ValueSpec::u32(1)])]);
+        let error = Writer::new(&ctx, &emitter)
+            .write(named_type(&ctx, "entries"), &Slot::at(0), &spec)
+            .expect_err("a u32 is not an entry");
+        assert!(format!("{error:#}").contains("element [0]"), "{error:#}");
+    }
+
+    #[test]
+    fn a_list_part_cannot_join_a_string() {
+        let ctx = context(LIST_WIT);
+        let emitter = Emitter::new(2);
+        let spec = ValueSpec::concat([
+            ValueSpec::string("a"),
+            ValueSpec::source(ValueRef {
+                ty: named_type(&ctx, "name"),
+                slot: Slot::at(1),
+            }),
+            ValueSpec::list([ValueSpec::string("b")]),
+        ]);
+        let error = Writer::new(&ctx, &emitter)
+            .write(named_type(&ctx, "name"), &Slot::at(0), &spec)
+            .expect_err("a string is not a list of strings");
+        assert!(
+            format!("{error:#}").contains("cannot join a string"),
+            "{error:#}"
+        );
+    }
+
+    /// The interface named `name`.
+    fn interface<'r>(resolve: &'r Resolve, name: &str) -> &'r wit_parser::Interface {
+        resolve
+            .interfaces
+            .iter()
+            .find_map(|(_, declared)| (declared.name.as_deref() == Some(name)).then_some(declared))
+            .expect("the interface")
+    }
+
+    /// The type `name` declared in `interface`.
+    fn declared_type(resolve: &Resolve, interface: &str, name: &str) -> wit_parser::Type {
+        wit_parser::Type::Id(self::interface(resolve, interface).types[name])
+    }
+
+    /// The result type of `function` in `interface`.
+    fn result_type(resolve: &Resolve, interface: &str, function: &str) -> wit_parser::Type {
+        self::interface(resolve, interface).functions[function]
+            .result
+            .expect("a result")
+    }
+
+    const EQUALITY_WIT: &str = r"package test:equality;
+        interface types {
+          record entry { name: string }
+          record renamed { name: string }
+          record other { title: string }
+          resource first;
+          resource second;
+        }
+        interface a {
+          use types.{entry, first};
+          entries: func() -> list<entry>;
+          own-first: func() -> first;
+        }
+        interface b {
+          use types.{entry, first, second};
+          entries: func() -> list<entry>;
+          own-first: func() -> first;
+          own-second: func() -> second;
+        }";
+
+    fn equality() -> Resolve {
+        let mut resolve = Resolve::new();
+        resolve.push_str("test.wit", EQUALITY_WIT).expect("parse");
+        resolve
+    }
+
+    #[test]
+    fn a_type_reached_through_two_aliases_is_equal() {
+        let resolve = equality();
+        let (a, b) = (
+            declared_type(&resolve, "a", "entry"),
+            declared_type(&resolve, "b", "entry"),
+        );
+        assert_ne!(a, b, "each interface's `use` is its own alias");
+        assert!(types_equal(&resolve, a, b));
+    }
+
+    #[test]
+    fn anonymous_types_using_two_aliases_are_equal() {
+        let resolve = equality();
+        let (a, b) = (
+            result_type(&resolve, "a", "entries"),
+            result_type(&resolve, "b", "entries"),
+        );
+        assert_ne!(
+            a, b,
+            "each `list<entry>` refers to its own interface's `entry` alias"
+        );
+        assert!(types_equal(&resolve, a, b));
+    }
+
+    #[test]
+    fn record_names_are_ignored_but_field_names_are_not() {
+        let resolve = equality();
+        let entry = declared_type(&resolve, "types", "entry");
+        assert!(types_equal(
+            &resolve,
+            entry,
+            declared_type(&resolve, "types", "renamed")
+        ));
+        assert!(!types_equal(
+            &resolve,
+            entry,
+            declared_type(&resolve, "types", "other")
+        ));
+    }
+
+    #[test]
+    fn handles_are_equal_only_for_the_same_resource() {
+        let resolve = equality();
+        let first = result_type(&resolve, "a", "own-first");
+        assert!(types_equal(
+            &resolve,
+            first,
+            result_type(&resolve, "b", "own-first")
+        ));
+        assert!(!types_equal(
+            &resolve,
+            first,
+            result_type(&resolve, "b", "own-second")
+        ));
     }
 
     #[test]
