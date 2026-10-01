@@ -3,6 +3,8 @@ members = [
     "calculator",
     "helloworld",
     "logging-interceptor",
+    "routing-greeter",
+    "routing-greeter/greeter",
 ]
 resolver = "3"
 

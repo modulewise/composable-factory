@@ -1,0 +1,5 @@
+package example:routing-greeter;
+
+interface greeter {
+    greet: func(name: string) -> string;
+}

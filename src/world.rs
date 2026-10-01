@@ -495,6 +495,142 @@ impl Value {
         ))
     }
 
+    /// Branch on this string's content against literals, the string
+    /// counterpart of [`Value::dispatch`]. Arms are tried in order and the
+    /// first match runs, so an exact arm belongs before a prefix it overlaps.
+    /// The set of strings is open, so `otherwise` runs when no arm matches.
+    ///
+    /// An arm that could never run is an error: one an earlier arm shadows,
+    /// or an empty prefix, which leaves `otherwise` unreachable.
+    pub fn match_string(
+        &self,
+        arms: Vec<StringArm<'_>>,
+        otherwise: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        if !matches!(self.ty.kind(), Kind::String) {
+            bail!(
+                "match_string: this value is a {}, not a string",
+                self.ty.kind().name()
+            );
+        }
+        for (index, arm) in arms.iter().enumerate() {
+            if arm.is_prefix() && arm.literal.is_empty() {
+                bail!(
+                    "match_string: an empty prefix matches every string, so `otherwise` can never run"
+                );
+            }
+            if let Some(earlier) = arms[..index].iter().find(|earlier| earlier.shadows(arm)) {
+                bail!("match_string: {arm} can never match, because {earlier} comes before it");
+            }
+        }
+        let (pointer, length) = self.load_ptr_len()?;
+        self.match_arms(pointer, length, &mut arms.into_iter(), otherwise)
+    }
+
+    /// The if/else block over the arms a caller supplied, ending in
+    /// `otherwise`.
+    fn match_arms(
+        &self,
+        pointer: u32,
+        length: u32,
+        arms: &mut dyn Iterator<Item = StringArm<'_>>,
+        otherwise: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let Some(StringArm { literal, body }) = arms.next() else {
+            return otherwise();
+        };
+        let exact = matches!(body, StringArmBody::Exact(_));
+        let matched = self.matches_literal(pointer, length, literal.as_bytes(), exact)?;
+        self.emit(Instruction::LocalGet(matched));
+        self.emitter
+            .if_(BlockType::Empty, || match body {
+                StringArmBody::Exact(body) => body(),
+                StringArmBody::Prefix(body) => body(self.rest(pointer, length, literal.len())),
+            })?
+            .else_(|| self.match_arms(pointer, length, arms, otherwise))
+    }
+
+    /// A local holding whether the string at `{pointer, length}` equals
+    /// `literal`, or starts with it when not `exact`.
+    fn matches_literal(
+        &self,
+        pointer: u32,
+        length: u32,
+        literal: &[u8],
+        exact: bool,
+    ) -> Result<u32> {
+        let matched = self.local(ValType::I32);
+        self.emit(Instruction::LocalGet(length));
+        self.emit(Instruction::I32Const(literal.len() as i32));
+        self.emit(if exact {
+            Instruction::I32Eq
+        } else {
+            Instruction::I32GeU
+        });
+        self.emit(Instruction::LocalSet(matched));
+        if literal.is_empty() {
+            return Ok(matched);
+        }
+        // Long enough, so compare each of the literal's bytes, and clear
+        // `matched` at the first that differs.
+        let (offset, _) = self.ty.ctx.intern(literal);
+        let index = self.local(ValType::I32);
+        self.emit(Instruction::LocalGet(matched));
+        self.emitter.if_(BlockType::Empty, || {
+            self.emit(Instruction::I32Const(0));
+            self.emit(Instruction::LocalSet(index));
+            self.block("compare_done", || {
+                self.loop_("compare_loop", || {
+                    self.emit(Instruction::LocalGet(index));
+                    self.emit(Instruction::I32Const(literal.len() as i32));
+                    self.emit(Instruction::I32GeU);
+                    self.br_if("compare_done")?;
+                    self.emit(Instruction::LocalGet(pointer));
+                    self.emit(Instruction::LocalGet(index));
+                    self.emit(Instruction::I32Add);
+                    self.emit(Load::I32From8.instruction(0));
+                    self.emit(Instruction::LocalGet(index));
+                    self.emit(Load::I32From8.instruction(offset as usize));
+                    self.emit(Instruction::I32Ne);
+                    self.emitter.if_(BlockType::Empty, || {
+                        self.emit(Instruction::I32Const(0));
+                        self.emit(Instruction::LocalSet(matched));
+                        self.br("compare_done")
+                    })?;
+                    self.emit(Instruction::LocalGet(index));
+                    self.emit(Instruction::I32Const(1));
+                    self.emit(Instruction::I32Add);
+                    self.emit(Instruction::LocalSet(index));
+                    self.br("compare_loop")
+                })
+            })
+        })?;
+        Ok(matched)
+    }
+
+    /// The rest of the string at `{pointer, length}` after its first `skip`
+    /// bytes, as a string value pointing into the same memory, not a copy.
+    fn rest(&self, pointer: u32, length: u32, skip: usize) -> Value {
+        let rest_pointer = self.local(ValType::I32);
+        self.emit(Instruction::LocalGet(pointer));
+        self.emit(Instruction::I32Const(skip as i32));
+        self.emit(Instruction::I32Add);
+        self.emit(Instruction::LocalSet(rest_pointer));
+        let rest_length = self.local(ValType::I32);
+        self.emit(Instruction::LocalGet(length));
+        self.emit(Instruction::I32Const(skip as i32));
+        self.emit(Instruction::I32Sub);
+        self.emit(Instruction::LocalSet(rest_length));
+        Value::new(
+            self.ty.child(wit_parser::Type::String),
+            Slot::flat(vec![
+                Local::new(rest_pointer, ValType::I32),
+                Local::new(rest_length, ValType::I32),
+            ]),
+            self.emitter.clone(),
+        )
+    }
+
     /// Where this variant-like value's payload lives, the read-side twin of
     /// [`Value::write_disc`]'s return.
     ///
@@ -1334,6 +1470,70 @@ pub fn arm<'f>(
     MatchArm {
         case: case.into(),
         body: Box::new(body),
+    }
+}
+
+/// One arm of a [`Value::match_string`]: a literal, and the body to emit when
+/// the matched string equals it ([`exact`]) or starts with it ([`prefix`]).
+/// Anything else the body needs, it captures from its enclosing scope.
+pub struct StringArm<'f> {
+    literal: String,
+    body: StringArmBody<'f>,
+}
+
+impl StringArm<'_> {
+    fn is_prefix(&self) -> bool {
+        matches!(self.body, StringArmBody::Prefix(_))
+    }
+
+    /// Whether every string `other` matches is matched by this arm, so that
+    /// `other` can never run after it.
+    fn shadows(&self, other: &StringArm<'_>) -> bool {
+        if self.is_prefix() {
+            other.literal.starts_with(&self.literal)
+        } else {
+            !other.is_prefix() && other.literal == self.literal
+        }
+    }
+}
+
+/// The arm as its constructor call, for errors.
+impl std::fmt::Display for StringArm<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let constructor = if self.is_prefix() { "prefix" } else { "exact" };
+        write!(f, "{constructor}({:?})", self.literal)
+    }
+}
+
+/// What a [`StringArm`]'s body receives: nothing for an exact match, and the
+/// rest of the string after the literal for a prefix match.
+enum StringArmBody<'f> {
+    Exact(Box<dyn FnOnce() -> Result<()> + 'f>),
+    Prefix(Box<dyn FnOnce(Value) -> Result<()> + 'f>),
+}
+
+/// Build a [`StringArm`] for a string equal to `literal`, emitting `body`
+/// inside that arm's branch.
+pub fn exact<'f>(
+    literal: impl Into<String>,
+    body: impl FnOnce() -> Result<()> + 'f,
+) -> StringArm<'f> {
+    StringArm {
+        literal: literal.into(),
+        body: StringArmBody::Exact(Box::new(body)),
+    }
+}
+
+/// Build a [`StringArm`] for a string starting with `literal`, emitting
+/// `body` inside that arm's branch. The body receives the rest of the string
+/// as a string value pointing into the same memory, so nothing is copied.
+pub fn prefix<'f>(
+    literal: impl Into<String>,
+    body: impl FnOnce(Value) -> Result<()> + 'f,
+) -> StringArm<'f> {
+    StringArm {
+        literal: literal.into(),
+        body: StringArmBody::Prefix(Box::new(body)),
     }
 }
 
