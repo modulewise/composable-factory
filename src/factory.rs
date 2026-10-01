@@ -1214,6 +1214,137 @@ mod tests {
         assert!(format!("{error:#}").contains("not a string"), "{error:#}");
     }
 
+    const CATALOG_WIT: &str = r"package test:catalog;
+        interface entries {
+          record entry { name: string, size: u32 }
+          name-of: func(e: entry) -> string;
+          size-of: func(e: entry) -> u32;
+          rename: func(entries: list<entry>) -> list<entry>;
+        }
+        world catalog { export entries; }";
+
+    /// Declare the `entries` export of a world named `catalog`.
+    fn catalog(world: &mut World, package: PackageSource) -> Result<()> {
+        world.add_exports(package.world("catalog")?.exports())
+    }
+
+    #[test]
+    fn fields_and_a_mapped_list_build() {
+        let bytes = build(&Factory {
+            wit: CATALOG_WIT,
+            declare: catalog,
+            body: |function, _| {
+                let result = function.result().expect("every function returns").value();
+                let param = function.params()[0].receive()?;
+                match function.name() {
+                    "name-of" => result.write(&ValueSpec::from(param.field("name")?)),
+                    "size-of" => result.write(&ValueSpec::from(param.field("size")?)),
+                    "rename" => {
+                        let renamed = param.map(result.ty(), |entry| {
+                            Ok(ValueSpec::record([
+                                (
+                                    "name",
+                                    ValueSpec::concat([
+                                        ValueSpec::string("x-"),
+                                        entry.field("name")?.into(),
+                                    ]),
+                                ),
+                                ("size", entry.field("size")?.into()),
+                            ]))
+                        })?;
+                        result.write(&ValueSpec::from(renamed))
+                    }
+                    other => panic!("unexpected function '{other}'"),
+                }
+            },
+        })
+        .expect("fields and a mapped list must build");
+        validate(&bytes);
+    }
+
+    #[test]
+    fn an_unknown_field_is_rejected() {
+        let error = build(&Factory {
+            wit: r"package test:catalog;
+                   interface entries {
+                     record entry { name: string, size: u32 }
+                     name-of: func(e: entry) -> string;
+                   }
+                   world catalog { export entries; }",
+            declare: catalog,
+            body: |function, _| {
+                let entry = function.params()[0].receive()?;
+                entry.field("title").map(|_| ())
+            },
+        })
+        .expect_err("entry has no title");
+        let message = format!("{error:#}");
+        assert!(message.contains("no field 'title'"), "{message}");
+        assert!(message.contains("declared: name, size"), "{message}");
+    }
+
+    const RESIZE_WIT: &str = r"package test:catalog;
+        interface entries {
+          record entry { name: string }
+          resize: func(size: u32, entries: list<entry>) -> list<entry>;
+        }
+        world catalog { export entries; }";
+
+    #[test]
+    fn only_a_record_has_fields() {
+        let error = build(&Factory {
+            wit: RESIZE_WIT,
+            declare: catalog,
+            body: |function, _| {
+                let size = function.params()[0].receive()?;
+                size.field("name").map(|_| ())
+            },
+        })
+        .expect_err("a u32 has no fields");
+        assert!(format!("{error:#}").contains("not a record"), "{error:#}");
+    }
+
+    #[test]
+    fn only_a_list_can_be_mapped() {
+        let error = build(&Factory {
+            wit: RESIZE_WIT,
+            declare: catalog,
+            body: |function, _| {
+                let size = function.params()[0].receive()?;
+                let output = function.result().expect("resize returns a list").value();
+                size.map(output.ty(), |_| {
+                    Ok(ValueSpec::list(Vec::<ValueSpec>::new()))
+                })
+                .map(|_| ())
+            },
+        })
+        .expect_err("a u32 has no elements");
+        assert!(
+            format!("{error:#}").contains("this value is a u32, not a list"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_list_can_only_be_mapped_to_a_list() {
+        let error = build(&Factory {
+            wit: RESIZE_WIT,
+            declare: catalog,
+            body: |function, _| {
+                let size = function.params()[0].receive()?;
+                let entries = function.params()[1].receive()?;
+                entries
+                    .map(size.ty(), |_| Ok(ValueSpec::u32(0)))
+                    .map(|_| ())
+            },
+        })
+        .expect_err("a u32 is not a list");
+        assert!(
+            format!("{error:#}").contains("the output is a u32, not a list"),
+            "{error:#}"
+        );
+    }
+
     #[test]
     fn a_received_value_copies_into_a_flat_record_field() {
         // A received param is a source, so writing it into a field copies its

@@ -631,6 +631,114 @@ impl Value {
         )
     }
 
+    /// This record's field `name`, addressed where it lives within this value.
+    pub fn field(&self, name: &str) -> Result<Value> {
+        let Kind::Record(fields) = self.ty.kind() else {
+            bail!(
+                "field: this value is a {}, not a record",
+                self.ty.kind().name()
+            );
+        };
+        let types: Vec<wit_parser::Type> = fields.iter().map(|field| field.ty().wit()).collect();
+        let slots = member_slots(&self.ty.ctx, &self.slot, &types)?;
+        let Some((field, slot)) = fields
+            .iter()
+            .zip(slots)
+            .find(|(field, _)| field.name() == name)
+        else {
+            bail!(
+                "field: no field '{name}' in this record (declared: {})",
+                fields
+                    .iter()
+                    .map(|field| field.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        };
+        Ok(self.at_slot(field.ty(), slot))
+    }
+
+    /// A new list of type `output`, with one element per element of this
+    /// list, each written from the spec `body` returns for it.
+    ///
+    /// The length is only known at runtime, so this emits a loop. `body` runs
+    /// once, while emitting, inside that loop: the element it receives, and
+    /// any value reached from it, is only valid there.
+    pub fn map(
+        &self,
+        output: Type,
+        body: impl FnOnce(Value) -> Result<ValueSpec>,
+    ) -> Result<Value> {
+        let Kind::List(input) = self.ty.kind() else {
+            bail!("map: this value is a {}, not a list", self.ty.kind().name());
+        };
+        let Kind::List(element) = output.kind() else {
+            bail!("map: the output is a {}, not a list", output.kind().name());
+        };
+        let layout = self.ty.ctx.layout();
+        let input_stride = layout.size(&input.wit());
+        let output_stride = layout.size(&element.wit());
+        let (pointer, length) = self.load_ptr_len()?;
+
+        let mapped = Local::new(self.local(ValType::I32), ValType::I32);
+        call_allocator(
+            &self.ty.ctx,
+            &self.emitter,
+            Size::Strided {
+                count: Local::new(length, ValType::I32),
+                stride: output_stride,
+            },
+        );
+        self.emit(Instruction::LocalSet(mapped.index));
+
+        let index = self.local(ValType::I32);
+        let from = self.local(ValType::I32);
+        let to = self.local(ValType::I32);
+        self.emit(Instruction::I32Const(0));
+        self.emit(Instruction::LocalSet(index));
+        self.block("map_done", || {
+            self.loop_("map_loop", || {
+                self.emit(Instruction::LocalGet(index));
+                self.emit(Instruction::LocalGet(length));
+                self.emit(Instruction::I32GeU);
+                self.br_if("map_done")?;
+                // The current element of each list: base + index * stride.
+                for (element_pointer, base, stride) in [
+                    (from, pointer, input_stride),
+                    (to, mapped.index, output_stride),
+                ] {
+                    self.emit(Instruction::LocalGet(base));
+                    self.emit(Instruction::LocalGet(index));
+                    self.emit(Instruction::I32Const(stride as i32));
+                    self.emit(Instruction::I32Mul);
+                    self.emit(Instruction::I32Add);
+                    self.emit(Instruction::LocalSet(element_pointer));
+                }
+                let spec = body(self.at_base(input, from, 0))?;
+                self.writer()
+                    .write(element.wit(), &Slot::at(to), &spec)
+                    .context("in a mapped element")?;
+                self.emit(Instruction::LocalGet(index));
+                self.emit(Instruction::I32Const(1));
+                self.emit(Instruction::I32Add);
+                self.emit(Instruction::LocalSet(index));
+                self.br("map_loop")
+            })
+        })?;
+
+        // Copy the length into a new local, because when the input list is
+        // held in locals, `length` is one of those locals, and code after the
+        // map operation could overwrite it.
+        let mapped_length = Local::new(self.local(ValType::I32), ValType::I32);
+        self.emit(Instruction::LocalGet(length));
+        self.emit(Instruction::LocalSet(mapped_length.index));
+        Ok(Value::new(
+            output,
+            Slot::flat(vec![mapped, mapped_length]),
+            self.emitter.clone(),
+        ))
+    }
+
     /// Where this variant-like value's payload lives, the read-side twin of
     /// [`Value::write_disc`]'s return.
     ///
