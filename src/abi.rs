@@ -15,6 +15,10 @@ use crate::module::{
 /// The heap pointer that allocations advance.
 const HEAP: u32 = 0;
 
+/// The tasks in progress within this instance, each one an exported function
+/// call. The heap is reset only when no tasks are in progress.
+const TASKS: u32 = 1;
+
 /// The name the component encoder expects for the allocator.
 const REALLOC: &str = "cabi_realloc";
 
@@ -148,6 +152,18 @@ pub fn allocator_index(resolve: &Resolve, world: WorldId) -> u32 {
     (declared + builtins) as u32
 }
 
+/// The core index of `start_task`, which every exported function body calls
+/// first. It follows the allocator.
+pub fn start_task_index(resolve: &Resolve, world: WorldId) -> u32 {
+    allocator_index(resolve, world) + 1
+}
+
+/// The core index of `end_task`, which every exported function calls once its
+/// task no longer needs what it allocated. It follows `start_task`.
+pub fn end_task_index(resolve: &Resolve, world: WorldId) -> u32 {
+    allocator_index(resolve, world) + 2
+}
+
 /// The core index of the `task.return` builtin for an async export. The
 /// builtins follow the declared imports, with one per async export in
 /// declaration order.
@@ -273,21 +289,20 @@ pub fn import_returns_indirectly(resolve: &Resolve, func: &Function) -> bool {
     resolve.wasm_signature(import_variant(func), func).retptr
 }
 
-/// An exported function's core signature, plus the params of the cleanup
-/// function it needs.
+/// An exported function's core signature, plus the params of its post-return.
 ///
-/// Cleanup is needed only when the result is returned through memory rather
-/// than in core values: the export returns a pointer, and the caller passes it
-/// back once it has read the value, so the memory can be released. Async
-/// exports deliver through `task.return`, so nothing is left to release.
+/// Every sync export gets a post-return, which ends its task once the caller
+/// has read the result. Its params are the core results, as the canonical ABI
+/// requires. An async export has no post-return: its task ends right after
+/// `task.return`.
 pub fn export_signature(
     resolve: &Resolve,
     func: &Function,
 ) -> (Vec<ValType>, Vec<ValType>, Option<Vec<ValType>>) {
     let signature = resolve.wasm_signature(export_variant(func), func);
     let (params, results) = val_types(&signature);
-    let cleanup = (!func.kind.is_async() && signature.retptr).then(|| results.clone());
-    (params, results, cleanup)
+    let post_return = (!func.kind.is_async()).then(|| results.clone());
+    (params, results, post_return)
 }
 
 /// The name a function is exported under, with async exports prefixed to mark
@@ -374,9 +389,9 @@ pub struct GeneratedFunction {
 /// The function index space is laid out here:
 /// 1. the component's declared imports
 /// 2. one `task.return` builtin per async export
-/// 3. the allocator
+/// 3. the allocator, then `start_task` and `end_task`
 /// 4. the generated bodies
-/// 5. a cleanup function for each export that needs one
+/// 5. a post-return for each sync export
 pub fn core_module(
     resolve: &Resolve,
     world: WorldId,
@@ -427,14 +442,29 @@ pub fn core_module(
         "the allocator follows every import"
     );
     let heap_base = align8(data.len()) as i32;
-    let mut functions = vec![CoreFunction {
-        params: vec![ValType::I32, ValType::I32, ValType::I32, ValType::I32],
-        results: vec![ValType::I32],
-        body: allocator_body(),
-        export_name: REALLOC.to_string(),
-    }];
+    let mut functions = vec![
+        CoreFunction {
+            params: vec![ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+            results: vec![ValType::I32],
+            body: allocator_body(),
+            export_name: Some(REALLOC.to_string()),
+        },
+        CoreFunction {
+            params: Vec::new(),
+            results: Vec::new(),
+            body: start_task_body(),
+            export_name: None,
+        },
+        CoreFunction {
+            params: Vec::new(),
+            results: Vec::new(),
+            body: end_task_body(heap_base),
+            export_name: None,
+        },
+    ];
+    let end_task = end_task_index(resolve, world);
 
-    let mut cleanups = Vec::new();
+    let mut post_returns = Vec::new();
     for generated in generated {
         let declared = exported_function(
             resolve,
@@ -442,31 +472,33 @@ pub fn core_module(
             generated.interface.as_ref(),
             &generated.func,
         )?;
-        let (params, results, cleanup) = export_signature(resolve, declared);
+        let (params, results, post_return) = export_signature(resolve, declared);
         let name = export_name(resolve, generated.interface.as_ref(), declared);
-        if let Some(cleanup_params) = cleanup {
-            cleanups.push(CoreFunction {
-                params: cleanup_params,
+        if let Some(post_return_params) = post_return {
+            post_returns.push(CoreFunction {
+                params: post_return_params,
                 results: Vec::new(),
-                body: heap_reset_body(heap_base),
-                export_name: format!("cabi_post_{name}"),
+                body: post_return_body(end_task),
+                export_name: Some(format!("cabi_post_{name}")),
             });
         }
         functions.push(CoreFunction {
             params,
             results,
             body: generated.body,
-            export_name: name,
+            export_name: Some(name),
         });
     }
-    functions.extend(cleanups);
+    functions.extend(post_returns);
 
     Ok(CoreModule {
         imports,
         functions,
         memories: vec![CoreMemory {
             ty: MemoryType {
-                minimum: 1,
+                // The data segment sits at address 0, so the initial memory
+                // must be large enough to hold it. At least one page.
+                minimum: data.len().div_ceil(PAGE_SIZE as usize).max(1) as u64,
                 maximum: None,
                 memory64: false,
                 shared: false,
@@ -474,21 +506,32 @@ pub fn core_module(
             },
             export_name: Some(MEMORY.to_string()),
         }],
-        globals: vec![CoreGlobal {
-            ty: GlobalType {
-                val_type: ValType::I32,
-                mutable: true,
-                shared: false,
+        // In index order: `HEAP`, then `TASKS`.
+        globals: vec![
+            CoreGlobal {
+                ty: GlobalType {
+                    val_type: ValType::I32,
+                    mutable: true,
+                    shared: false,
+                },
+                init: ConstExpr::i32_const(heap_base),
             },
-            init: ConstExpr::i32_const(heap_base),
-        }],
+            CoreGlobal {
+                ty: GlobalType {
+                    val_type: ValType::I32,
+                    mutable: true,
+                    shared: false,
+                },
+                init: ConstExpr::i32_const(0),
+            },
+        ],
         types,
         data,
     })
 }
 
-/// A bump allocator: hand out the next aligned address, then advance past it.
-/// Called with the canonical ABI's `(old_ptr, old_len, align, new_len)`.
+/// A bump allocator: hands out the next aligned address, then advances past
+/// it. Called with the canonical ABI's `(old_ptr, old_len, align, new_len)`.
 ///
 /// A resize request traps, because the allocator cannot grow a block in place,
 /// and returning fresh memory while abandoning the old contents would silently
@@ -501,40 +544,160 @@ pub fn core_module(
 /// is not a multiple of 8 leaves the heap global holding an unaligned address,
 /// but the next call rounds it up before returning a pointer, so no store ever
 /// sees a misaligned base.
+///
+/// Memory grows as needed, up to the 4 GiB a 32-bit memory can address or any
+/// lower limit the host sets. Sizes can come from imports at runtime, so this
+/// uses 64-bit arithmetic: adding two 32-bit values cannot wrap, and a block
+/// that would end past 4 GiB traps rather than wrapping to a low address. A
+/// block that would end past a limit set by the host also traps.
+///
+/// Nothing is freed individually: the heap is reset once no task is in
+/// progress (see [`end_task_body`]). So nothing allocated during a task may
+/// outlive it, and overlapping async tasks keep everything they allocate until
+/// the last one ends.
 fn allocator_body() -> wasm_encoder::Function {
+    use wasm_encoder::Instruction::*;
+
     let emitter = Emitter::new(4);
-    let pointer = emitter.local(ValType::I32);
+    let start = emitter.local(ValType::I64);
+    let end = emitter.local(ValType::I64);
+    let trap_if = |condition: &[wasm_encoder::Instruction<'static>]| {
+        for instruction in condition {
+            emitter.emit(instruction.clone());
+        }
+        emitter
+            .if_(wasm_encoder::BlockType::Empty, || {
+                emitter.trap();
+                Ok(())
+            })
+            .expect("no frames to close");
+    };
+
     // This allocator cannot support a resize request.
-    emitter.emit(wasm_encoder::Instruction::LocalGet(0));
-    emitter.emit(wasm_encoder::Instruction::LocalGet(1));
-    emitter.emit(wasm_encoder::Instruction::I32Or);
+    trap_if(&[LocalGet(0), LocalGet(1), I32Or]);
+    // The next 8-aligned address, which is what this call returns.
+    for instruction in [
+        GlobalGet(HEAP),
+        I64ExtendI32U,
+        I64Const(7),
+        I64Add,
+        I64Const(-8),
+        I64And,
+        LocalSet(start),
+    ] {
+        emitter.emit(instruction);
+    }
+    // Where the block ends, which must be within the 32-bit address space.
+    for instruction in [
+        LocalGet(start),
+        LocalGet(3),
+        I64ExtendI32U,
+        I64Add,
+        LocalSet(end),
+    ] {
+        emitter.emit(instruction);
+    }
+    trap_if(&[LocalGet(end), I64Const(u32::MAX as i64), I64GtU]);
+    // Grow memory by the pages the block needs beyond its current end.
+    let memory_end = [MemorySize(0), I64ExtendI32U, I64Const(PAGE_BITS), I64Shl];
+    emitter.emit(LocalGet(end));
+    for instruction in memory_end.clone() {
+        emitter.emit(instruction);
+    }
+    emitter.emit(I64GtU);
+    emitter
+        .if_(wasm_encoder::BlockType::Empty, || {
+            emitter.emit(LocalGet(end));
+            for instruction in memory_end {
+                emitter.emit(instruction);
+            }
+            for instruction in [
+                I64Sub,
+                I64Const(PAGE_SIZE - 1),
+                I64Add,
+                I64Const(PAGE_BITS),
+                I64ShrU,
+                I32WrapI64,
+            ] {
+                emitter.emit(instruction);
+            }
+            trap_if(&[MemoryGrow(0), I32Const(-1), I32Eq]);
+            Ok(())
+        })
+        .expect("no frames to close");
+    // Advance past the block, and return its start.
+    for instruction in [
+        LocalGet(end),
+        I32WrapI64,
+        GlobalSet(HEAP),
+        LocalGet(start),
+        I32WrapI64,
+    ] {
+        emitter.emit(instruction);
+    }
+    emitter.encode().expect("no frames to close")
+}
+
+/// The size of a wasm page, the unit of `memory.size` and `memory.grow`, as a
+/// power of two: a page count shifted left by this many bits is a byte count.
+const PAGE_BITS: i64 = 16;
+
+/// The size of a wasm page, the unit of `memory.size` and `memory.grow`.
+const PAGE_SIZE: i64 = 1 << PAGE_BITS;
+
+/// Counts a task as in progress.
+fn start_task_body() -> wasm_encoder::Function {
+    use wasm_encoder::Instruction::*;
+
+    let emitter = Emitter::new(0);
+    for instruction in [GlobalGet(TASKS), I32Const(1), I32Add, GlobalSet(TASKS)] {
+        emitter.emit(instruction);
+    }
+    emitter.encode().expect("no frames to close")
+}
+
+/// Counts a task as no longer needing what it allocated, and releases
+/// everything allocated by resetting the heap once no task is in progress.
+///
+/// Ending a task when none is in progress traps: it can only be a miscount,
+/// and continuing would wrap the count, after which the heap could be reset
+/// while a task is in progress.
+fn end_task_body(heap_base: i32) -> wasm_encoder::Function {
+    use wasm_encoder::Instruction::*;
+
+    let emitter = Emitter::new(0);
+    emitter.emit(GlobalGet(TASKS));
+    emitter.emit(I32Eqz);
     emitter
         .if_(wasm_encoder::BlockType::Empty, || {
             emitter.trap();
             Ok(())
         })
         .expect("no frames to close");
-    // The next 8-aligned address, which is what this call returns.
-    emitter.emit(wasm_encoder::Instruction::GlobalGet(HEAP));
-    emitter.emit(wasm_encoder::Instruction::I32Const(7));
-    emitter.emit(wasm_encoder::Instruction::I32Add);
-    emitter.emit(wasm_encoder::Instruction::I32Const(-8));
-    emitter.emit(wasm_encoder::Instruction::I32And);
-    emitter.emit(wasm_encoder::Instruction::LocalSet(pointer));
-    // Advance past the request.
-    emitter.emit(wasm_encoder::Instruction::LocalGet(pointer));
-    emitter.emit(wasm_encoder::Instruction::LocalGet(3));
-    emitter.emit(wasm_encoder::Instruction::I32Add);
-    emitter.emit(wasm_encoder::Instruction::GlobalSet(HEAP));
-    emitter.emit(wasm_encoder::Instruction::LocalGet(pointer));
+    for instruction in [
+        GlobalGet(TASKS),
+        I32Const(1),
+        I32Sub,
+        GlobalSet(TASKS),
+        GlobalGet(TASKS),
+        I32Eqz,
+    ] {
+        emitter.emit(instruction);
+    }
+    emitter
+        .if_(wasm_encoder::BlockType::Empty, || {
+            emitter.emit(I32Const(heap_base));
+            emitter.emit(GlobalSet(HEAP));
+            Ok(())
+        })
+        .expect("no frames to close");
     emitter.encode().expect("no frames to close")
 }
 
-/// Releases everything allocated during a call by resetting the heap.
-fn heap_reset_body(heap_base: i32) -> wasm_encoder::Function {
+/// Ends a sync export's task once the caller has read the result.
+fn post_return_body(end_task: u32) -> wasm_encoder::Function {
     let emitter = Emitter::new(0);
-    emitter.emit(wasm_encoder::Instruction::I32Const(heap_base));
-    emitter.emit(wasm_encoder::Instruction::GlobalSet(HEAP));
+    emitter.emit(wasm_encoder::Instruction::Call(end_task));
     emitter.encode().expect("no frames to close")
 }
 
@@ -591,10 +754,12 @@ mod tests {
     const LOCAL_GET: u8 = 0x20;
     const LOCAL_SET: u8 = 0x21;
     const GLOBAL_GET: u8 = 0x23;
-    const I32_CONST: u8 = 0x41;
-    const I32_ADD: u8 = 0x6A;
-    const I32_AND: u8 = 0x71;
+    const I64_CONST: u8 = 0x42;
     const I32_OR: u8 = 0x72;
+    const I64_ADD: u8 = 0x7C;
+    const I64_AND: u8 = 0x83;
+    const I32_WRAP_I64: u8 = 0xA7;
+    const I64_EXTEND_I32_U: u8 = 0xAD;
 
     /// Parse `wit` and return its single world.
     fn world(wit: &str) -> (Resolve, WorldId) {
@@ -861,32 +1026,27 @@ mod tests {
     }
 
     #[test]
-    fn a_direct_result_needs_no_cleanup() {
-        let (resolve, w) = world(r"package test:direct; world w { export f: func() -> s32; }");
-        let (_, func) = only_function(&resolve, w);
-        let (params, results, cleanup) = export_signature(&resolve, &func);
-        assert!(params.is_empty());
-        assert_eq!(results, vec![ValType::I32]);
-        assert_eq!(cleanup, None);
+    fn a_sync_exports_results_are_its_post_return_params() {
+        // A direct `s32`, and a string returned through memory as a pointer.
+        for wit in [
+            r"package test:direct; world w { export f: func() -> s32; }",
+            r"package test:indirect; world w { export f: func() -> string; }",
+        ] {
+            let (resolve, w) = world(wit);
+            let (_, func) = only_function(&resolve, w);
+            let (_, results, post_return) = export_signature(&resolve, &func);
+            assert_eq!(results, vec![ValType::I32], "{wit}");
+            assert_eq!(post_return, Some(results), "{wit}");
+        }
     }
 
     #[test]
-    fn an_indirect_result_is_cleaned_up_by_its_own_results() {
-        let (resolve, w) = world(r"package test:indirect; world w { export f: func() -> string; }");
-        let (_, func) = only_function(&resolve, w);
-        let (_, results, cleanup) = export_signature(&resolve, &func);
-        // A string is returned via memory, so the result is a pointer to it.
-        assert_eq!(results, vec![ValType::I32]);
-        assert_eq!(cleanup, Some(results));
-    }
-
-    #[test]
-    fn an_async_export_needs_no_cleanup() {
+    fn an_async_export_has_no_post_return() {
         let (resolve, w) =
             world(r"package test:slow; world w { export f: async func() -> string; }");
         let (_, func) = only_function(&resolve, w);
-        let (.., cleanup) = export_signature(&resolve, &func);
-        assert_eq!(cleanup, None);
+        let (.., post_return) = export_signature(&resolve, &func);
+        assert_eq!(post_return, None);
     }
 
     #[test]
@@ -1075,7 +1235,10 @@ mod tests {
         )
         .unwrap();
         // The allocator is the first defined function, and takes four params.
-        assert_eq!(module.functions[0].export_name, "cabi_realloc");
+        assert_eq!(
+            module.functions[0].export_name.as_deref(),
+            Some("cabi_realloc")
+        );
         assert_eq!(module.functions[0].params.len(), 4);
         validate(module);
     }
@@ -1128,9 +1291,18 @@ mod tests {
     #[test]
     fn the_allocator_returns_the_rounded_address() {
         let body = allocator_bytes("allocalign");
-        // The rounding computed from the heap (`0x78` is -8 in signed LEB128).
+        // The rounding computed from the heap, with 64 bits so it cannot wrap
+        // (`0x78` is -8 in signed LEB128).
         let rounding = [
-            GLOBAL_GET, HEAP as u8, I32_CONST, 7, I32_ADD, I32_CONST, 0x78, I32_AND,
+            GLOBAL_GET,
+            HEAP as u8,
+            I64_EXTEND_I32_U,
+            I64_CONST,
+            7,
+            I64_ADD,
+            I64_CONST,
+            0x78,
+            I64_AND,
         ];
         let at = body
             .windows(rounding.len())
@@ -1143,9 +1315,9 @@ mod tests {
         );
         let rounded = body[stored + 1];
         assert_eq!(
-            &body[body.len() - 3..],
-            &[LOCAL_GET, rounded, END],
-            "the function returns the stored local: {body:02x?}"
+            &body[body.len() - 4..],
+            &[LOCAL_GET, rounded, I32_WRAP_I64, END],
+            "the function returns the stored local, as an address: {body:02x?}"
         );
     }
 
@@ -1170,25 +1342,56 @@ mod tests {
         )
         .unwrap();
         assert_eq!(module.imports.len(), 1);
-        // One import. So allocator is index 1 and generated body index 2.
-        assert_eq!(module.functions.len(), 2);
+        // One import. So the allocator is index 1, `start_task` and `end_task`
+        // are 2 and 3, the generated body is 4, and its post-return 5.
+        assert_eq!(module.functions.len(), 5);
+        assert_eq!(allocator_index(&resolve, w), 1);
+        assert_eq!(start_task_index(&resolve, w), 2);
+        assert_eq!(end_task_index(&resolve, w), 3);
         validate(module);
     }
 
     #[test]
-    fn an_indirect_result_gets_a_cleanup_export() {
-        let (resolve, w) =
-            world(r"package test:cleanup; world w { export run: func() -> string; }");
-        let generated = vec![GeneratedFunction {
-            interface: None,
-            func: "run".to_string(),
-            body: {
+    fn every_sync_export_gets_a_post_return_export() {
+        let (resolve, w) = world(
+            r"package test:post-returns;
+              world w {
+                export text: func() -> string;
+                export flat: func() -> s32;
+                export none: func();
+                export later: async func();
+              }",
+        );
+        let body = |instructions: &[wasm_encoder::Instruction<'static>]| {
+            let emitter = Emitter::new(0);
+            for instruction in instructions {
+                emitter.emit(instruction.clone());
+            }
+            emitter.encode().expect("body")
+        };
+        let generated = vec![
+            GeneratedFunction {
+                interface: None,
+                func: "text".to_string(),
                 // The signature returns a pointer, so the body must leave one.
-                let emitter = Emitter::new(0);
-                emitter.emit(wasm_encoder::Instruction::I32Const(0));
-                emitter.encode().expect("body")
+                body: body(&[wasm_encoder::Instruction::I32Const(0)]),
             },
-        }];
+            GeneratedFunction {
+                interface: None,
+                func: "flat".to_string(),
+                body: body(&[wasm_encoder::Instruction::I32Const(0)]),
+            },
+            GeneratedFunction {
+                interface: None,
+                func: "none".to_string(),
+                body: body(&[]),
+            },
+            GeneratedFunction {
+                interface: None,
+                func: "later".to_string(),
+                body: body(&[]),
+            },
+        ];
         let module = core_module(
             &resolve,
             w,
@@ -1200,42 +1403,26 @@ mod tests {
         let names: Vec<&str> = module
             .functions
             .iter()
-            .map(|f| f.export_name.as_str())
+            .filter_map(|f| f.export_name.as_deref())
             .collect();
-        assert_eq!(names, vec!["cabi_realloc", "run", "cabi_post_run"]);
+        assert_eq!(
+            names,
+            vec![
+                "cabi_realloc",
+                "text",
+                "flat",
+                "none",
+                "[async-lift-stackful]later",
+                "cabi_post_text",
+                "cabi_post_flat",
+                "cabi_post_none",
+            ]
+        );
         validate(module);
     }
 
     #[test]
-    fn a_direct_result_gets_no_cleanup_export() {
-        let (resolve, w) = world(r"package test:nocleanup; world w { export run: func() -> s32; }");
-        let generated = vec![GeneratedFunction {
-            interface: None,
-            func: "run".to_string(),
-            body: {
-                let emitter = Emitter::new(0);
-                emitter.emit(wasm_encoder::Instruction::I32Const(0));
-                emitter.encode().expect("body")
-            },
-        }];
-        let module = core_module(
-            &resolve,
-            w,
-            generated,
-            TypeTable::default(),
-            Data::default(),
-        )
-        .unwrap();
-        let names: Vec<&str> = module
-            .functions
-            .iter()
-            .map(|f| f.export_name.as_str())
-            .collect();
-        assert_eq!(names, vec!["cabi_realloc", "run"]);
-    }
-
-    #[test]
-    fn an_assembled_module_declares_a_heap_global() {
+    fn an_assembled_module_declares_the_heap_and_task_globals() {
         let (resolve, w) = world(r"package test:heap; world w { export run: func(); }");
         let mut data = Data::default();
         data.intern(b"hello");
@@ -1245,7 +1432,7 @@ mod tests {
             body: empty_body(),
         }];
         let module = core_module(&resolve, w, generated, TypeTable::default(), data).unwrap();
-        assert_eq!(module.globals.len(), 1);
+        assert_eq!(module.globals.len(), 2);
         validate(module);
     }
 

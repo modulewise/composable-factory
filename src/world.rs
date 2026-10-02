@@ -1275,16 +1275,22 @@ impl Value {
             }
             Ok(())
         };
-        // The last case needs no test. Every other case has been ruled out.
-        if case + 1 == cases.len() {
-            return write_case(self, visitor);
-        }
+        // The last case is tested too: the index comes from the visitor at
+        // runtime, and if no case matches, it traps rather than writing.
+        let last = case + 1 == cases.len();
         self.emit(Instruction::LocalGet(disc));
         self.emit(Instruction::I32Const(case as i32));
         self.emit(Instruction::I32Eq);
         self.emitter
             .if_(BlockType::Empty, || write_case(self, visitor))?
-            .else_(|| self.write_cases(cases, case + 1, disc, visitor))
+            .else_(|| {
+                if last {
+                    self.emitter.trap();
+                    Ok(())
+                } else {
+                    self.write_cases(cases, case + 1, disc, visitor)
+                }
+            })
     }
 
     /// Build a list or map: ask the visitor how many items there are, allocate
@@ -2871,7 +2877,7 @@ mod tests {
                 params,
                 results: Vec::new(),
                 body: function,
-                export_name: "walk".to_string(),
+                export_name: Some("walk".to_string()),
             }],
             memories: vec![crate::module::CoreMemory {
                 ty: wasm_encoder::MemoryType {
@@ -3097,6 +3103,20 @@ mod tests {
     const I32_LOAD16U: u8 = 0x2F;
     const I32_ADD: u8 = 0x6A;
     const I32_MUL: u8 = 0x6C;
+    const I64_CONST: u8 = 0x42;
+    const I64_MUL: u8 = 0x7E;
+
+    /// How many times `bytes` multiplies by `stride`: as an `i32` to address
+    /// an element, and as an `i64` to size the allocation without wrapping.
+    fn strides(bytes: &[u8], stride: u8) -> (usize, usize) {
+        let count = |constant, multiply| {
+            bytes
+                .windows(3)
+                .filter(|window| window == &[constant, stride, multiply])
+                .count()
+        };
+        (count(I32_CONST, I32_MUL), count(I64_CONST, I64_MUL))
+    }
 
     /// The raw body bytes a walk emits.
     fn walk_bytes(wit: &str, type_name: &str) -> Vec<u8> {
@@ -3483,7 +3503,7 @@ mod tests {
                 params,
                 results: Vec::new(),
                 body: function,
-                export_name: "build".to_string(),
+                export_name: Some("build".to_string()),
             }],
             memories: vec![crate::module::CoreMemory {
                 ty: wasm_encoder::MemoryType {
@@ -3601,39 +3621,27 @@ mod tests {
     }
 
     #[test]
-    fn a_required_field_traps_but_an_option_writes_none() {
-        // `traps` scans a whole body, and every walk emits an absent branch
-        // for the value it starts from. Starting at an `option` makes that
-        // branch write `none`, leaving the field's own branch as the only one
-        // that can contribute a trap.
-        let required = build_bytes(
-            r"package test:buildreq;
-              interface i {
-                record r { x: u32 }
-                type maybe = option<r>;
-                f: func(v: maybe);
-              }
-              world w { import i; }",
-            "maybe",
-        );
-        assert!(
-            traps(&required),
-            "an absent `u32` field has nothing to write"
-        );
-        let optional = build_bytes(
-            r"package test:buildopt;
-              interface i {
-                record r { x: option<u32> }
-                type maybe = option<r>;
-                f: func(v: maybe);
-              }
-              world w { import i; }",
-            "maybe",
-        );
-        assert!(
-            !traps(&optional),
-            "an absent `option` field writes `none`, so nothing traps"
-        );
+    fn an_absent_value_traps_unless_it_is_an_option() {
+        let absent = |type_name: &str| {
+            let ctx = context(
+                r"package test:absent;
+                  interface i {
+                    record r { x: u32 }
+                    type maybe = option<u32>;
+                    f: func(r: r, m: maybe);
+                  }
+                  world w { import i; }",
+            );
+            let ty = named_type_in(&ctx, type_name);
+            let emitter = Emitter::new(1);
+            let slot = reserve(&ctx, &emitter, ty.wit()).expect("reserve");
+            Value::new(ty, slot, emitter.clone())
+                .write_absent()
+                .expect("write");
+            emitter.encode().expect("encode").into_raw_body()
+        };
+        assert!(traps(&absent("r")), "a record has nothing to write");
+        assert!(!traps(&absent("maybe")), "an option writes `none`");
     }
 
     /// Whether a body contains `unreachable`. Reads operators rather than
@@ -3729,14 +3737,10 @@ mod tests {
               world w { import i; }",
             "wide",
         );
-        // `i32.const 8` followed by `i32.mul`.
-        let strided = bytes
-            .windows(3)
-            .filter(|window| window[0] == I32_CONST && window[1] == 8 && window[2] == I32_MUL)
-            .count();
         assert_eq!(
-            strided, 2,
-            "the stride sizes the allocation and addresses each entry: {bytes:02x?}"
+            strides(&bytes, 8),
+            (1, 1),
+            "the stride addresses each entry and sizes the allocation: {bytes:02x?}"
         );
     }
 
@@ -3750,13 +3754,10 @@ mod tests {
               world w { import i; }",
             "table",
         );
-        let strided = bytes
-            .windows(3)
-            .filter(|window| window[0] == I32_CONST && window[1] == 16 && window[2] == I32_MUL)
-            .count();
         assert_eq!(
-            strided, 2,
-            "16 sizes the allocation and strides each entry: {bytes:02x?}"
+            strides(&bytes, 16),
+            (1, 1),
+            "16 strides each entry and sizes the allocation: {bytes:02x?}"
         );
     }
 

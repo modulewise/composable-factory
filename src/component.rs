@@ -53,7 +53,6 @@ impl Component {
                 entry.interface.as_ref(),
                 entry.async_index,
             );
-            // The body's first instructions, before the factory can emit.
             builder.reserve_result()?;
             build_function(&builder.function(), &builder.imports())
                 .with_context(|| format!("building '{}'", entry.func))?;
@@ -123,6 +122,11 @@ impl FunctionBuilder {
         async_index: Option<usize>,
     ) -> Self {
         let emitter = Emitter::new(param_count);
+        // The task's first instruction, before anything is allocated.
+        emitter.emit(Instruction::Call(abi::start_task_index(
+            ctx.resolve(),
+            ctx.world(),
+        )));
         let function = ExportedFunction::new(
             Rc::clone(&ctx),
             emitter.clone(),
@@ -137,7 +141,7 @@ impl FunctionBuilder {
         }
     }
 
-    /// Allocate this function's result, the body's first instructions.
+    /// Allocate this function's result, before anything the factory emits.
     /// Called before the implementor's callback is invoked.
     pub(crate) fn reserve_result(&mut self) -> Result<()> {
         let Some(ty) = self.function.result_type() else {
@@ -167,7 +171,8 @@ impl FunctionBuilder {
         Imports::new(Rc::clone(&self.ctx), self.emitter.clone())
     }
 
-    /// Emit this function's result delivery, then produce the encoded body.
+    /// Emit this function's result delivery, and for an async export the end
+    /// of its task, then produce the encoded body.
     ///
     /// | result | emits |
     /// |---|---|
@@ -177,6 +182,16 @@ impl FunctionBuilder {
     /// | some, async | flats-or-pointer, then `task.return` |
     pub(crate) fn build(self) -> Result<wasm_encoder::Function> {
         self.deliver_result()?;
+        // An async task ends right after `task.return`, the last thing the
+        // body does. A sync task is ended by the export's post-return instead,
+        // even with no result to read: the runtime calls it however the body
+        // returned, including by an early `return` emitted through `body()`.
+        if self.function.wit().kind.is_async() {
+            self.emitter.emit(Instruction::Call(abi::end_task_index(
+                self.ctx.resolve(),
+                self.ctx.world(),
+            )));
+        }
         self.emitter.encode()
     }
 
