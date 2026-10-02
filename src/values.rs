@@ -352,7 +352,8 @@ impl ValueSpec {
         }
     }
 
-    /// A variant case without a payload, which is how an enum is represented.
+    /// A variant case without a payload, which is how an enum is represented,
+    /// and how a result's `ok` or `err` without a payload is written.
     pub fn variant_unit(case: impl Into<String>) -> ValueSpec {
         ValueSpec::Variant {
             case: case.into(),
@@ -889,24 +890,37 @@ impl<'a> Writer<'a> {
                     .ctx
                     .layout()
                     .payload_offset(Int::U8, [ok.as_ref(), err.as_ref()]);
-                match value {
-                    ValueSpec::Ok(payload) => {
-                        let payload_slot = self.write_disc(slot, Int::U8, 0, payload_offset)?;
-                        match ok {
-                            Some(ty) => self.write(ty, &payload_slot, payload).context("in ok(..)"),
-                            None => bail!("ok(..) value but result has no ok type"),
-                        }
-                    }
-                    ValueSpec::Err(payload) => {
-                        let payload_slot = self.write_disc(slot, Int::U8, 1, payload_offset)?;
-                        match err {
-                            Some(ty) => {
-                                self.write(ty, &payload_slot, payload).context("in err(..)")
-                            }
-                            None => bail!("err(..) value but result has no err type"),
-                        }
-                    }
-                    _ => bail!("expected an Ok/Err value for a result<T,E> type"),
+                // A case without a payload takes a unit variant case, as an
+                // enum's cases do.
+                let (disc, case, case_ty, payload) = match value {
+                    ValueSpec::Ok(payload) => (0, "ok", ok, Some(&**payload)),
+                    ValueSpec::Err(payload) => (1, "err", err, Some(&**payload)),
+                    ValueSpec::Variant {
+                        case,
+                        payload: None,
+                    } if case == "ok" => (0, "ok", ok, None),
+                    ValueSpec::Variant {
+                        case,
+                        payload: None,
+                    } if case == "err" => (1, "err", err, None),
+                    ValueSpec::Variant {
+                        case,
+                        payload: None,
+                    } => bail!("no case '{case}' in a result type (expected ok or err)"),
+                    ValueSpec::Variant { case, .. } => bail!(
+                        "a result case with a payload is written with ValueSpec::ok or \
+                         ValueSpec::err, not as variant case '{case}'"
+                    ),
+                    _ => bail!("expected an ok or err value for a result type"),
+                };
+                let payload_slot = self.write_disc(slot, Int::U8, disc, payload_offset)?;
+                match (case_ty, payload) {
+                    (Some(ty), Some(supplied)) => self
+                        .write(ty, &payload_slot, supplied)
+                        .with_context(|| format!("in {case}(..)")),
+                    (None, None) => Ok(()),
+                    (Some(_), None) => bail!("{case} needs a payload"),
+                    (None, Some(_)) => bail!("{case} takes no payload in this result type"),
                 }
             }
             TypeDefKind::List(elem) => {
@@ -1107,9 +1121,11 @@ impl<'a> Writer<'a> {
             self.check_part(part, element)?;
         }
 
-        let length = Local::new(self.emitter.local(ValType::I32), ValType::I32);
-        self.emit(Instruction::I32Const(0));
-        self.emit(Instruction::LocalSet(length.index));
+        // The parts' lengths are summed with 64 bits, so the sum cannot wrap
+        // to a small allocation that the copies below would overrun.
+        let total = self.emitter.local(ValType::I64);
+        self.emit(Instruction::I64Const(0));
+        self.emit(Instruction::LocalSet(total));
         // A copied part's elements are located once, so the copy below reads
         // the same locals the sum did.
         let mut parts_to_join = Vec::with_capacity(parts.len());
@@ -1121,17 +1137,24 @@ impl<'a> Writer<'a> {
                     Part::Copied { pointer, length }
                 }
             };
-            let count = match &part {
-                Part::Copied { length, .. } => Instruction::LocalGet(*length),
+            match &part {
+                Part::Copied { length, .. } => {
+                    self.emit(Instruction::LocalGet(*length));
+                    self.emit(Instruction::I64ExtendI32U);
+                }
                 Part::Written([]) => continue,
-                Part::Written(items) => Instruction::I32Const(items.len() as i32),
-            };
-            self.emit(Instruction::LocalGet(length.index));
-            self.emit(count);
-            self.emit(Instruction::I32Add);
-            self.emit(Instruction::LocalSet(length.index));
+                Part::Written(items) => self.emit(Instruction::I64Const(items.len() as i64)),
+            }
+            self.emit(Instruction::LocalGet(total));
+            self.emit(Instruction::I64Add);
+            self.emit(Instruction::LocalSet(total));
             parts_to_join.push(part);
         }
+        trap_if_beyond_u32(self.emitter, total);
+        let length = Local::new(self.emitter.local(ValType::I32), ValType::I32);
+        self.emit(Instruction::LocalGet(total));
+        self.emit(Instruction::I32WrapI64);
+        self.emit(Instruction::LocalSet(length.index));
 
         let pointer = Local::new(self.emitter.local(ValType::I32), ValType::I32);
         call_allocator(
@@ -1597,19 +1620,46 @@ pub(crate) enum Size {
 /// Emit a call to the allocator, leaving the pointer on the stack. The
 /// canonical ABI's realloc takes `(old_ptr, old_len, align, new_len)`, and a
 /// fresh allocation passes zero for the first two.
+///
+/// A size computed at runtime traps if it exceeds the 32-bit address space,
+/// rather than wrapping to a small allocation that later writes overrun.
 pub(crate) fn call_allocator(ctx: &BuildContext, emitter: &Emitter, size: Size) {
+    let size = match size {
+        Size::Const(bytes) => Instruction::I32Const(bytes as i32),
+        Size::Strided { count, stride } => {
+            let bytes = emitter.local(ValType::I64);
+            emitter.emit(Instruction::LocalGet(count.index));
+            emitter.emit(Instruction::I64ExtendI32U);
+            emitter.emit(Instruction::I64Const(stride as i64));
+            emitter.emit(Instruction::I64Mul);
+            emitter.emit(Instruction::LocalSet(bytes));
+            trap_if_beyond_u32(emitter, bytes);
+            let wrapped = emitter.local(ValType::I32);
+            emitter.emit(Instruction::LocalGet(bytes));
+            emitter.emit(Instruction::I32WrapI64);
+            emitter.emit(Instruction::LocalSet(wrapped));
+            Instruction::LocalGet(wrapped)
+        }
+    };
     emitter.emit(Instruction::I32Const(0));
     emitter.emit(Instruction::I32Const(0));
     emitter.emit(Instruction::I32Const(ALIGN));
-    match size {
-        Size::Const(bytes) => emitter.emit(Instruction::I32Const(bytes as i32)),
-        Size::Strided { count, stride } => {
-            emitter.emit(Instruction::LocalGet(count.index));
-            emitter.emit(Instruction::I32Const(stride as i32));
-            emitter.emit(Instruction::I32Mul);
-        }
-    }
+    emitter.emit(size);
     emitter.emit(Instruction::Call(ctx.allocator()));
+}
+
+/// Trap if the i64 in `local` exceeds what 32 bits can hold, such as a byte
+/// count past the 32-bit address space.
+pub(crate) fn trap_if_beyond_u32(emitter: &Emitter, local: u32) {
+    emitter.emit(Instruction::LocalGet(local));
+    emitter.emit(Instruction::I64Const(u32::MAX as i64));
+    emitter.emit(Instruction::I64GtU);
+    emitter
+        .if_(BlockType::Empty, || {
+            emitter.trap();
+            Ok(())
+        })
+        .expect("an if with an empty body cannot fail");
 }
 
 /// Reserve storage for a value of `ty`, returning the corresponding slot.
@@ -2265,7 +2315,7 @@ mod tests {
                 params,
                 results,
                 body: function,
-                export_name: "load".to_string(),
+                export_name: Some("load".to_string()),
             }],
             memories: vec![crate::module::CoreMemory {
                 ty: wasm_encoder::MemoryType {
@@ -2447,7 +2497,7 @@ mod tests {
                 params,
                 results,
                 body: function,
-                export_name: "write".to_string(),
+                export_name: Some("write".to_string()),
             }],
             memories: vec![crate::module::CoreMemory {
                 ty: wasm_encoder::MemoryType {
@@ -2923,6 +2973,36 @@ mod tests {
               world w { import i; }";
         writes_memory(wit, "outcome", &ValueSpec::ok(ValueSpec::u32(1)));
         writes_memory(wit, "outcome", &ValueSpec::err(ValueSpec::string("no")));
+    }
+
+    #[test]
+    fn a_result_rejects_a_case_without_the_payload_it_declares() {
+        let ctx = context(
+            r"package test:writebadres;
+              interface i { type outcome = result<u32, string>; f: func(o: outcome); }
+              world w { import i; }",
+        );
+        let ty = named_type(&ctx, "outcome");
+        let emitter = Emitter::new(1);
+        let error = Writer::new(&ctx, &emitter)
+            .write(ty, &Slot::at(0), &ValueSpec::variant_unit("ok"))
+            .expect_err("`ok` carries a u32");
+        assert!(format!("{error:#}").contains("ok needs a payload"));
+    }
+
+    #[test]
+    fn a_result_names_a_case_it_does_not_declare() {
+        let ctx = context(
+            r"package test:writeresname;
+              interface i { type outcome = result<_, string>; f: func(o: outcome); }
+              world w { import i; }",
+        );
+        let ty = named_type(&ctx, "outcome");
+        let emitter = Emitter::new(1);
+        let error = Writer::new(&ctx, &emitter)
+            .write(ty, &Slot::at(0), &ValueSpec::variant_unit("Ok"))
+            .expect_err("a result has no case 'Ok'");
+        assert!(format!("{error:#}").contains("no case 'Ok'"));
     }
 
     #[test]

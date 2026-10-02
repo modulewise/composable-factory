@@ -51,11 +51,9 @@ impl CoreModule {
         let mut exports = ExportSection::new();
         let first_defined = self.imports.len() as u32;
         for (offset, function) in self.functions.iter().enumerate() {
-            exports.export(
-                &function.export_name,
-                ExportKind::Func,
-                first_defined + offset as u32,
-            );
+            if let Some(name) = &function.export_name {
+                exports.export(name, ExportKind::Func, first_defined + offset as u32);
+            }
         }
         for (index, memory) in self.memories.iter().enumerate() {
             if let Some(name) = &memory.export_name {
@@ -108,12 +106,12 @@ pub struct CoreImport {
 }
 
 /// One function the module defines: its signature, its body, and the name it
-/// is exported under.
+/// is exported under, if any.
 pub struct CoreFunction {
     pub params: Vec<ValType>,
     pub results: Vec<ValType>,
     pub body: EncodedFunction,
-    pub export_name: String,
+    pub export_name: Option<String>,
 }
 
 /// One memory the module declares, and the name it is exported under.
@@ -237,7 +235,7 @@ mod tests {
             params: Vec::new(),
             results: Vec::new(),
             body,
-            export_name: export_name.to_string(),
+            export_name: Some(export_name.to_string()),
         }
     }
 
