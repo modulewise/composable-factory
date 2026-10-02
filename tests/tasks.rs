@@ -78,7 +78,7 @@ impl ComponentBuilder for Tasks {
     }
 }
 
-/// A store's data: the limits its memory is held to.
+/// Store data that holds the store's memory limit.
 struct Limited {
     limits: StoreLimits,
 }

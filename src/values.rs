@@ -352,7 +352,8 @@ impl ValueSpec {
         }
     }
 
-    /// A variant case without a payload, which is how an enum is represented.
+    /// A variant case without a payload, which is how an enum is represented,
+    /// and how a result's `ok` or `err` without a payload is written.
     pub fn variant_unit(case: impl Into<String>) -> ValueSpec {
         ValueSpec::Variant {
             case: case.into(),
@@ -902,6 +903,14 @@ impl<'a> Writer<'a> {
                         case,
                         payload: None,
                     } if case == "err" => (1, "err", err, None),
+                    ValueSpec::Variant {
+                        case,
+                        payload: None,
+                    } => bail!("no case '{case}' in a result type (expected ok or err)"),
+                    ValueSpec::Variant { case, .. } => bail!(
+                        "a result case with a payload is written with ValueSpec::ok or \
+                         ValueSpec::err, not as variant case '{case}'"
+                    ),
                     _ => bail!("expected an ok or err value for a result type"),
                 };
                 let payload_slot = self.write_disc(slot, Int::U8, disc, payload_offset)?;
@@ -2979,6 +2988,21 @@ mod tests {
             .write(ty, &Slot::at(0), &ValueSpec::variant_unit("ok"))
             .expect_err("`ok` carries a u32");
         assert!(format!("{error:#}").contains("ok needs a payload"));
+    }
+
+    #[test]
+    fn a_result_names_a_case_it_does_not_declare() {
+        let ctx = context(
+            r"package test:writeresname;
+              interface i { type outcome = result<_, string>; f: func(o: outcome); }
+              world w { import i; }",
+        );
+        let ty = named_type(&ctx, "outcome");
+        let emitter = Emitter::new(1);
+        let error = Writer::new(&ctx, &emitter)
+            .write(ty, &Slot::at(0), &ValueSpec::variant_unit("Ok"))
+            .expect_err("a result has no case 'Ok'");
+        assert!(format!("{error:#}").contains("no case 'Ok'"));
     }
 
     #[test]

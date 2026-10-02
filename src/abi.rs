@@ -552,9 +552,9 @@ pub fn core_module(
 /// block that would end past a limit set by the host also traps.
 ///
 /// Nothing is freed individually: the heap is reset once no task is in
-/// progress (see [`end_task_body`]). So nothing allocated during a task may
-/// outlive it, and overlapping async tasks keep everything they allocate until
-/// the last one ends.
+/// progress (see [`end_task_body`]). So anything allocated during a task may
+/// be overwritten once it ends, though overlapping tasks keep everything they
+/// allocate until the last one ends.
 fn allocator_body() -> wasm_encoder::Function {
     use wasm_encoder::Instruction::*;
 
