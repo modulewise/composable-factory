@@ -1073,8 +1073,16 @@ impl<'a> Writer<'a> {
             }
             TypeDefKind::FixedLengthList(elem, count) => {
                 let (elem, count) = (*elem, *count as usize);
-                let ValueSpec::List(items) = value else {
-                    bail!("expected a List value for a list<T, N> type");
+                // A fixed-length list holds its elements inline, so each byte
+                // is written as an element, not interned as with a `list<u8>`.
+                let bytes: Vec<ValueSpec>;
+                let items = match value {
+                    ValueSpec::List(items) => items,
+                    ValueSpec::Leaf(Leaf::Bytes(literal)) => {
+                        bytes = literal.iter().map(|byte| ValueSpec::u8(*byte)).collect();
+                        &bytes
+                    }
+                    _ => bail!("expected a List value for a list<T, N> type"),
                 };
                 if items.len() != count {
                     bail!(
@@ -2928,6 +2936,18 @@ mod tests {
               world w { import i; }",
             "color",
             &ValueSpec::variant_unit("green"),
+        );
+    }
+
+    #[test]
+    fn a_fixed_length_list_takes_byte_literals() {
+        // Byte literals reach the writer as `Bytes`.
+        writes_memory(
+            r"package test:writefixedbytes;
+              interface i { type four = list<u8, 4>; f: func(b: four); }
+              world w { import i; }",
+            "four",
+            &ValueSpec::list([1, 2, 3, 4].map(ValueSpec::u8)),
         );
     }
 
