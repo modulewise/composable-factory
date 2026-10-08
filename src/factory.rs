@@ -897,7 +897,7 @@ mod tests {
     #[test]
     fn a_joined_slot_reconciles_lists_and_flags_as_variant_cases() {
         // A list writes a pointer and a length; flags write their bitset
-        // words. Neither goes through `push_scalar`, but both land in joined
+        // words. Neither goes through `scalar_const`, but both land in joined
         // slots a wider sibling declared, so both still need reconciling.
         let bytes = build(&Factory {
             wit: r"package test:nonscalars;
@@ -1212,6 +1212,32 @@ mod tests {
         })
         .expect_err("a u32 cannot be matched against strings");
         assert!(format!("{error:#}").contains("not a string"), "{error:#}");
+    }
+
+    #[test]
+    fn an_argument_of_another_type_names_both_types() {
+        // A string and a list<u8> flatten alike, but they are not one type.
+        let error = build(&Factory {
+            wit: r"package test:mismatch;
+                   interface sink { put: func(items: list<u8>); }
+                   world caller { import sink; export run: func(text: string); }",
+            declare: |world, package| {
+                let caller = package.world("caller")?;
+                world.add_imports(caller.imports())?;
+                world.add_exports(caller.exports())
+            },
+            body: |function, imports| {
+                let text = function.params()[0].receive()?;
+                imports.interface("sink")?.function("put")?.call(&[text])?;
+                Ok(())
+            },
+        })
+        .expect_err("a string cannot be passed as a list<u8>");
+        assert!(
+            format!("{error:#}")
+                .contains("the value is `string` but the param 'items' is `list<u8>`"),
+            "{error:#}"
+        );
     }
 
     const CATALOG_WIT: &str = r"package test:catalog;

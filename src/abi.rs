@@ -191,13 +191,10 @@ pub fn export_variant(func: &wit_parser::Function) -> AbiVariant {
     }
 }
 
-/// The ABI variant for lowering a call to an imported function.
-pub fn import_variant(func: &wit_parser::Function) -> AbiVariant {
-    if func.kind.is_async() {
-        AbiVariant::GuestImportAsync
-    } else {
-        AbiVariant::GuestImport
-    }
+/// The ABI variant for declaring and calling imports. Currently, the
+/// factory lowers every import synchronously, including async ones.
+pub fn import_variant() -> AbiVariant {
+    AbiVariant::GuestImport
 }
 
 /// How a component's types are laid out in linear memory.
@@ -286,7 +283,21 @@ pub fn export_returns_indirectly(resolve: &Resolve, func: &Function) -> bool {
 
 /// Whether an imported function writes its result into memory.
 pub fn import_returns_indirectly(resolve: &Resolve, func: &Function) -> bool {
-    resolve.wasm_signature(import_variant(func), func).retptr
+    resolve.wasm_signature(import_variant(), func).retptr
+}
+
+/// Whether an exported function receives its params in memory.
+pub fn export_takes_params_indirectly(resolve: &Resolve, func: &Function) -> bool {
+    resolve
+        .wasm_signature(export_variant(func), func)
+        .indirect_params
+}
+
+/// Whether a call to an imported function passes its params in memory.
+pub fn import_takes_params_indirectly(resolve: &Resolve, func: &Function) -> bool {
+    resolve
+        .wasm_signature(import_variant(), func)
+        .indirect_params
 }
 
 /// An exported function's core signature, plus the params of its post-return.
@@ -405,7 +416,7 @@ pub fn core_module(
         imports.push(match entry {
             ImportEntry::Func { interface, func } => {
                 let declared = imported_function(resolve, world, interface.as_ref(), &func)?;
-                let (params, results) = core_signature(resolve, declared, AbiVariant::GuestImport);
+                let (params, results) = core_signature(resolve, declared, import_variant());
                 CoreImport {
                     module,
                     name: func,

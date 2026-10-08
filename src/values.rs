@@ -2,8 +2,9 @@
 //!
 //! [`crate::abi`] states the rules for flat types, layouts, and signatures.
 //! This layer carries them out for a particular value at a particular place:
-//! [`Slot`] says where it sits, [`Writer`] fills it from a [`ValueSpec`], and
-//! [`Loader`] lifts it onto the stack.
+//! [`Slot`] says where it sits, and [`Writer`] fills it from a [`ValueSpec`]
+//! or copies it to another slot. Pushing a value in memory onto the stack
+//! uses that copy too, into locals first.
 //!
 //! The navigable `Value` a factory holds in its World is one layer above this.
 //! It crosses down to here as a [`ValueRef`], which is a type and a slot
@@ -82,14 +83,6 @@ impl BuildContext {
         self.module_state.borrow_mut().data.intern(bytes)
     }
 
-    /// Intern a func type, returning its index in the type section.
-    pub(crate) fn func_type(&self, params: &[ValType], results: &[ValType]) -> u32 {
-        self.module_state
-            .borrow_mut()
-            .types
-            .func_type(params, results)
-    }
-
     /// Take what the bodies appended, once they have all finished.
     pub(crate) fn take_module_state(&self) -> (TypeTable, Data) {
         let state = std::mem::take(&mut *self.module_state.borrow_mut());
@@ -160,6 +153,14 @@ impl Slot {
             Slot::Flat { locals } => locals,
             Slot::Memory { .. } => &[],
         }
+    }
+
+    /// The slot of a variant-like value's payload, which follows its
+    /// discriminant. When in memory, it's `payload_offset` bytes into the
+    /// value. When flat, it's every local after the first. The payload's type
+    /// varies per case, so this is the slot only.
+    pub fn payload(&self, payload_offset: usize) -> Slot {
+        self.member(payload_offset, 1, self.locals().len())
     }
 
     /// The slot of a member: `bytes` further into the memory form, or the
@@ -443,245 +444,10 @@ impl ValueSpec {
     }
 }
 
-/// Lifts a value out of linear memory onto the stack, in canonical flat order.
-pub struct Loader<'a> {
-    ctx: &'a BuildContext,
-    emitter: &'a Emitter,
-}
-
-impl<'a> Loader<'a> {
-    pub fn new(ctx: &'a BuildContext, emitter: &'a Emitter) -> Self {
-        Loader { ctx, emitter }
-    }
-
-    fn emit(&self, instruction: Instruction<'static>) {
-        self.emitter.emit(instruction);
-    }
-
-    /// Leave `ty`'s flats on the stack, read from `[base]`, and report their
-    /// core types.
-    pub fn load(&self, ty: wit_parser::Type, base: u32) -> Result<Vec<ValType>> {
-        let flats = abi::flat_types(self.ctx.resolve(), ty)?;
-        self.load_at(ty, base, 0, &flats)?;
-        Ok(flats)
-    }
-
-    /// `expected` is the core signature these flats must have. It equals
-    /// `ty`'s own flats at the top level, but inside a variant arm it is the
-    /// joined slot types, so a narrow case widens into them. Its length always
-    /// covers `ty`'s flats, which is what keeps the slicing below in bounds.
-    fn load_at(
-        &self,
-        ty: wit_parser::Type,
-        base: u32,
-        offset: usize,
-        expected: &[ValType],
-    ) -> Result<()> {
-        let id = match ty {
-            wit_parser::Type::Bool | wit_parser::Type::U8 | wit_parser::Type::S8 => {
-                return self.leaf(base, offset, Load::I32From8, expected);
-            }
-            wit_parser::Type::U16 | wit_parser::Type::S16 => {
-                return self.leaf(base, offset, Load::I32From16, expected);
-            }
-            wit_parser::Type::U32
-            | wit_parser::Type::S32
-            | wit_parser::Type::Char
-            | wit_parser::Type::ErrorContext => {
-                return self.leaf(base, offset, Load::I32, expected);
-            }
-            wit_parser::Type::U64 | wit_parser::Type::S64 => {
-                return self.leaf(base, offset, Load::I64, expected);
-            }
-            wit_parser::Type::F32 => return self.leaf(base, offset, Load::F32, expected),
-            wit_parser::Type::F64 => return self.leaf(base, offset, Load::F64, expected),
-            wit_parser::Type::String => return self.pointer_and_length(base, offset, expected),
-            wit_parser::Type::Id(id) => id,
-        };
-        match self.ctx.resolve().types[id].kind.clone() {
-            TypeDefKind::Type(inner) => self.load_at(inner, base, offset, expected),
-            // A handle is one i32, whatever it refers to.
-            TypeDefKind::Handle(_) | TypeDefKind::Future(_) | TypeDefKind::Stream(_) => {
-                self.leaf(base, offset, Load::I32, expected)
-            }
-            TypeDefKind::Record(record) => {
-                let types: Vec<wit_parser::Type> = record.fields.iter().map(|f| f.ty).collect();
-                self.load_members(&types, base, offset, expected)
-            }
-            TypeDefKind::Tuple(tuple) => self.load_members(&tuple.types, base, offset, expected),
-            TypeDefKind::List(_) | TypeDefKind::Map(_, _) => {
-                self.pointer_and_length(base, offset, expected)
-            }
-            TypeDefKind::FixedLengthList(elem, count) => {
-                let types = vec![elem; count as usize];
-                self.load_members(&types, base, offset, expected)
-            }
-            TypeDefKind::Enum(e) => self.leaf(base, offset, Load::for_tag(e.tag()), expected),
-            TypeDefKind::Flags(flags) => {
-                // A flags type is only as wide as its count needs, so a
-                // four-byte load could read past it into whatever follows.
-                let load = Load::for_tag(flag_width(flags.flags.len()));
-                self.leaf(base, offset, load, expected)
-            }
-            TypeDefKind::Option(inner) => {
-                self.load_variant(&[None, Some(inner)], Int::U8, base, offset, expected)
-            }
-            TypeDefKind::Result(result) => {
-                self.load_variant(&[result.ok, result.err], Int::U8, base, offset, expected)
-            }
-            TypeDefKind::Variant(variant) => {
-                let cases: Vec<Option<wit_parser::Type>> =
-                    variant.cases.iter().map(|case| case.ty).collect();
-                self.load_variant(&cases, variant.tag(), base, offset, expected)
-            }
-            TypeDefKind::Resource => bail!("a resource type has no value representation"),
-            TypeDefKind::Unknown => unreachable!("unresolved type"),
-        }
-    }
-
-    /// A variant-like value: its discriminant, then the joined payload flats.
-    ///
-    /// One `if`/`else` per case, each arm leaving the full joined payload width
-    /// on the stack so every branch agrees with the block's result type.
-    fn load_variant(
-        &self,
-        cases: &[Option<wit_parser::Type>],
-        tag: Int,
-        base: u32,
-        offset: usize,
-        expected: &[ValType],
-    ) -> Result<()> {
-        self.leaf(base, offset, Load::for_tag(tag), &expected[0..1])?;
-        let payload_expected = &expected[1..];
-        if payload_expected.is_empty() {
-            // Every case is a unit case: the discriminant is the whole value.
-            return Ok(());
-        }
-        let payload_offset = offset
-            + self
-                .ctx
-                .layout()
-                .payload_offset(tag, cases.iter().map(|case| case.as_ref()));
-        let block = BlockType::FunctionType(self.ctx.func_type(&[], payload_expected));
-        self.load_arms(
-            cases,
-            tag,
-            base,
-            offset,
-            payload_offset,
-            0,
-            payload_expected,
-            block,
-        )
-    }
-
-    /// The `if`/`else` chain, one level per case. The discriminant is reloaded
-    /// for each test rather than kept on the stack, which the arm's own result
-    /// occupies.
-    #[allow(clippy::too_many_arguments)]
-    fn load_arms(
-        &self,
-        cases: &[Option<wit_parser::Type>],
-        tag: Int,
-        base: u32,
-        disc_offset: usize,
-        payload_offset: usize,
-        case: usize,
-        expected: &[ValType],
-        block: BlockType,
-    ) -> Result<()> {
-        if case + 1 == cases.len() {
-            // The last case needs no test. Every other case has been ruled out.
-            return self.load_payload(&cases[case], base, payload_offset, expected);
-        }
-        self.emit(Instruction::LocalGet(base));
-        self.emit(Load::for_tag(tag).instruction(disc_offset));
-        self.emit(Instruction::I32Const(case as i32));
-        self.emit(Instruction::I32Eq);
-        self.emit(Instruction::If(block));
-        self.load_payload(&cases[case], base, payload_offset, expected)?;
-        self.emit(Instruction::Else);
-        self.load_arms(
-            cases,
-            tag,
-            base,
-            disc_offset,
-            payload_offset,
-            case + 1,
-            expected,
-            block,
-        )?;
-        self.emit(Instruction::End);
-        Ok(())
-    }
-
-    /// One case's payload, padded out to the joined width.
-    ///
-    /// A case narrower than the join pushes zeros for the slots it does not
-    /// fill, since every arm must leave the same stack shape.
-    fn load_payload(
-        &self,
-        case: &Option<wit_parser::Type>,
-        base: u32,
-        offset: usize,
-        expected: &[ValType],
-    ) -> Result<()> {
-        let filled = match case {
-            Some(ty) => {
-                let width = abi::flat_types(self.ctx.resolve(), *ty)?.len();
-                self.load_at(*ty, base, offset, &expected[..width])?;
-                width
-            }
-            None => 0,
-        };
-        for ty in &expected[filled..] {
-            self.emit(zero(*ty));
-        }
-        Ok(())
-    }
-
-    /// Each member's flats at its own offset, in order.
-    fn load_members(
-        &self,
-        types: &[wit_parser::Type],
-        base: u32,
-        offset: usize,
-        expected: &[ValType],
-    ) -> Result<()> {
-        let offsets = self.ctx.layout().field_offsets(types.iter());
-        let mut remaining = expected;
-        for (ty, member_offset) in types.iter().zip(offsets) {
-            let width = abi::flat_types(self.ctx.resolve(), *ty)?.len();
-            let (mine, rest) = remaining.split_at(width);
-            self.load_at(*ty, base, offset + member_offset, mine)?;
-            remaining = rest;
-        }
-        Ok(())
-    }
-
-    /// The `{pointer, length}` pair that represents a string, list, or map.
-    fn pointer_and_length(&self, base: u32, offset: usize, expected: &[ValType]) -> Result<()> {
-        self.leaf(base, offset, Load::I32, &expected[0..1])?;
-        self.leaf(base, offset + 4, Load::I32, &expected[1..2])
-    }
-
-    /// One leaf load, reconciled with its destination slot.
-    fn leaf(&self, base: u32, offset: usize, load: Load, expected: &[ValType]) -> Result<()> {
-        self.emit(Instruction::LocalGet(base));
-        self.emit(load.instruction(offset));
-        if let Some(&want) = expected.first() {
-            for instruction in bitcast(load.result(), want)? {
-                self.emit(instruction);
-            }
-        }
-        Ok(())
-    }
-}
-
 /// Lowers a spec into the slot a value occupies.
 ///
-/// The counterpart of [`Loader`] (which lifts bytes onto the stack); this
-/// fills a slot from a [`ValueSpec`].
+/// A spec that is an existing value goes through [`Writer::copy`], which also
+/// reads a value in memory into locals.
 pub struct Writer<'a> {
     ctx: &'a BuildContext,
     emitter: &'a Emitter,
@@ -698,13 +464,10 @@ impl<'a> Writer<'a> {
 
     /// Fill `slot` with `value`, a spec for something of type `ty`.
     pub fn write(&self, ty: wit_parser::Type, slot: &Slot, value: &ValueSpec) -> Result<()> {
-        // A source supplies content this layer did not author, so it
-        // short-circuits the type-directed walk.
+        // A source supplies content this layer did not author, so the writer
+        // copies it rather than building it from a spec.
         if let ValueSpec::Leaf(Leaf::Source(source)) = value {
-            return match slot {
-                Slot::Flat { locals } => self.copy_flat_from(source, locals),
-                _ => self.copy_from(source, ty, slot),
-            };
+            return self.copy(source, ty, slot);
         }
         // A non-composite in a flat slot is the locals themselves, so there is
         // nothing to walk. A composite falls through to the walk below, which
@@ -766,7 +529,7 @@ impl<'a> Writer<'a> {
                 self.write_interned_flat(bytes, locals)
             }
             Leaf::Concat(parts) => self.write_concat(ty, &Slot::flat(locals.to_vec()), parts),
-            Leaf::Source(source) => self.copy_flat_from(source, locals),
+            Leaf::Source(source) => self.copy(source, ty, &Slot::flat(locals.to_vec())),
             scalar => {
                 // The slot may be wider than this value: a variant's payload
                 // locals are the join of every case, so a 1-flat case fills
@@ -774,9 +537,10 @@ impl<'a> Writer<'a> {
                 let Some(&local) = locals.first() else {
                     bail!("a scalar needs at least one local, got 0");
                 };
-                let (push, actual) = push_scalar(scalar, ty)?;
-                self.emit(push);
-                self.set_local(local, actual)
+                let constant = scalar_const(scalar, ty)?;
+                let core = abi::flat_types(self.ctx.resolve(), ty)?[0];
+                self.emit(constant);
+                self.set_local(local, core)
             }
         }
     }
@@ -808,10 +572,13 @@ impl<'a> Writer<'a> {
             Leaf::Concat(parts) => self.write_concat(ty, &Slot::Memory { base, offset }, parts),
             Leaf::Source(_) => unreachable!("a source is handled in write() before type dispatch"),
             scalar => {
-                let (push, stored) = push_scalar(scalar, ty)?;
+                // Stored at the WIT type's own width: a `u8` constant is an
+                // i32, but four bytes would run past it into what follows.
+                let constant = scalar_const(scalar, ty)?;
+                let store = Store::for_leaf(ty).expect("scalar_const accepts only scalars");
                 self.emit(Instruction::LocalGet(base));
-                self.emit(push);
-                self.emit(Store::for_type(stored)?.instruction(offset));
+                self.emit(constant);
+                self.emit(store.instruction(offset));
                 Ok(())
             }
         }
@@ -1343,16 +1110,18 @@ impl<'a> Writer<'a> {
         pointer
     }
 
-    /// Copy a materialized value's bytes into a memory slot.
+    /// Copy a materialized value into `dest`, a slot for a `ty`.
     ///
-    /// A memory source is copied verbatim, preserving the type's exact
-    /// in-memory layout including padding: a variant with an 8-aligned payload
-    /// after a 1-byte discriminant has gaps between its flats, and
-    /// `memory.copy` of `size(ty)` bytes keeps them. A flat source has no
-    /// padding; its flats are the value, so they are stored contiguously.
-    fn copy_from(&self, source: &ValueRef, ty: wit_parser::Type, dest: &Slot) -> Result<()> {
-        // Both arms below size the copy from the source, so a mismatched type
-        // could under-write the value or overrun it into whatever follows.
+    /// Either side may be in memory or in locals. Within one kind the layouts
+    /// agree, so the copy moves memory byte for byte, padding included, and
+    /// locals one by one. Across kinds they do not: a `bool` is one byte in
+    /// memory but an i32 flat, and a variant's payload sits at its payload
+    /// offset in memory but right after the discriminant in flats. So the copy
+    /// walks the type, and only leaves convert between the two, each at its
+    /// own width.
+    pub(crate) fn copy(&self, source: &ValueRef, ty: wit_parser::Type, dest: &Slot) -> Result<()> {
+        // A mismatched type could under-write the value or overrun it into
+        // whatever follows.
         let (source_size, dest_size) = (
             self.ctx.layout().size(&source.ty),
             self.ctx.layout().size(&ty),
@@ -1363,15 +1132,38 @@ impl<'a> Writer<'a> {
                  destination of {dest_size}"
             );
         }
-        let (base, offset) = self.memory_dest(dest)?;
-        match &source.slot {
-            Slot::Memory {
-                base: source_base,
-                offset: source_offset,
-            } => {
-                self.emit(Instruction::LocalGet(base));
-                if offset != 0 {
-                    self.emit(Instruction::I32Const(offset as i32));
+        // Locals may be wider than the value: a variant's payload locals are
+        // the join of every case, so a narrow case fills only the leading
+        // ones. Hence `<`, not `!=`. Only a side in locals is checked, since
+        // a value in memory may be too wide to flatten at all.
+        let any_flat =
+            matches!(source.slot, Slot::Flat { .. }) || matches!(dest, Slot::Flat { .. });
+        let width = if any_flat {
+            abi::flat_types(self.ctx.resolve(), source.ty)?.len()
+        } else {
+            0
+        };
+        for (slot, side) in [(&source.slot, "source"), (dest, "destination")] {
+            if let Slot::Flat { locals } = slot
+                && locals.len() < width
+            {
+                bail!(
+                    "the value flattens to {width} core values but the {side} has only {} locals",
+                    locals.len()
+                );
+            }
+        }
+        match (&source.slot, dest) {
+            (
+                Slot::Memory {
+                    base: source_base,
+                    offset: source_offset,
+                },
+                Slot::Memory { base, offset },
+            ) => {
+                self.emit(Instruction::LocalGet(*base));
+                if *offset != 0 {
+                    self.emit(Instruction::I32Const(*offset as i32));
                     self.emit(Instruction::I32Add);
                 }
                 self.emit(Instruction::LocalGet(*source_base));
@@ -1379,27 +1171,163 @@ impl<'a> Writer<'a> {
                     self.emit(Instruction::I32Const(*source_offset as i32));
                     self.emit(Instruction::I32Add);
                 }
-                self.emit(Instruction::I32Const(
-                    self.ctx.layout().size(&source.ty) as i32
-                ));
+                self.emit(Instruction::I32Const(source_size as i32));
                 self.emit(Instruction::MemoryCopy {
                     src_mem: 0,
                     dst_mem: 0,
                 });
                 Ok(())
             }
-            Slot::Flat { locals } => {
-                let flats = abi::flat_types(self.ctx.resolve(), source.ty)?;
-                let mut cursor = offset;
-                for (local, flat) in locals.iter().zip(&flats) {
-                    self.emit(Instruction::LocalGet(base));
-                    self.emit(Instruction::LocalGet(local.index));
-                    self.emit(Store::for_type(*flat)?.instruction(cursor));
-                    cursor += flat_width(*flat)?;
+            (Slot::Flat { locals: from }, Slot::Flat { locals: to }) => {
+                for (to, from) in to.iter().zip(from).take(width) {
+                    self.set_local_from(*to, *from)?;
                 }
                 Ok(())
             }
+            (from, to) => self.copy_walk(source.ty, from, to),
         }
+    }
+
+    /// Copy a `ty` between a memory slot and a flat one, in either direction.
+    ///
+    /// Member slots carry their own offsets and local ranges, so descending
+    /// never needs to know which side is which. Only a leaf does.
+    fn copy_walk(&self, ty: wit_parser::Type, from: &Slot, to: &Slot) -> Result<()> {
+        if let (Some(load), Some(store)) = (Load::for_leaf(ty), Store::for_leaf(ty)) {
+            return self.copy_leaf(load, store, from, to);
+        }
+        let id = match ty {
+            wit_parser::Type::String => return self.copy_pointer_and_length(from, to),
+            wit_parser::Type::Id(id) => id,
+            other => unreachable!("{other:?} has a leaf load and store"),
+        };
+        match self.ctx.resolve().types[id].kind.clone() {
+            TypeDefKind::Type(inner) => self.copy_walk(inner, from, to),
+            // A handle is one i32, whatever it refers to.
+            TypeDefKind::Handle(_) | TypeDefKind::Future(_) | TypeDefKind::Stream(_) => {
+                self.copy_leaf(Load::I32, Store::I32, from, to)
+            }
+            TypeDefKind::Record(record) => {
+                let types: Vec<wit_parser::Type> = record.fields.iter().map(|f| f.ty).collect();
+                self.copy_members(&types, from, to)
+            }
+            TypeDefKind::Tuple(tuple) => self.copy_members(&tuple.types, from, to),
+            TypeDefKind::FixedLengthList(elem, count) => {
+                self.copy_members(&vec![elem; count as usize], from, to)
+            }
+            TypeDefKind::List(_) | TypeDefKind::Map(_, _) => self.copy_pointer_and_length(from, to),
+            TypeDefKind::Enum(e) => {
+                self.copy_leaf(Load::for_tag(e.tag()), Store::for_tag(e.tag()), from, to)
+            }
+            TypeDefKind::Flags(flags) => {
+                let width = flag_width(flags.flags.len());
+                self.copy_leaf(Load::for_tag(width), Store::for_tag(width), from, to)
+            }
+            TypeDefKind::Option(inner) => {
+                self.copy_variant(&[None, Some(inner)], Int::U8, from, to)
+            }
+            TypeDefKind::Result(result) => {
+                self.copy_variant(&[result.ok, result.err], Int::U8, from, to)
+            }
+            TypeDefKind::Variant(variant) => {
+                let cases: Vec<Option<wit_parser::Type>> =
+                    variant.cases.iter().map(|case| case.ty).collect();
+                self.copy_variant(&cases, variant.tag(), from, to)
+            }
+            TypeDefKind::Resource => bail!("a resource type has no value representation"),
+            TypeDefKind::Unknown => unreachable!("unresolved type"),
+        }
+    }
+
+    /// Each member between its own slots on either side.
+    fn copy_members(&self, types: &[wit_parser::Type], from: &Slot, to: &Slot) -> Result<()> {
+        let from_members = member_slots(self.ctx, from, types)?;
+        let to_members = member_slots(self.ctx, to, types)?;
+        for ((ty, from), to) in types.iter().zip(&from_members).zip(&to_members) {
+            self.copy_walk(*ty, from, to)?;
+        }
+        Ok(())
+    }
+
+    /// The `{pointer, length}` pair of a string, list, or map. The elements
+    /// stay where they are, in their own heap block.
+    fn copy_pointer_and_length(&self, from: &Slot, to: &Slot) -> Result<()> {
+        self.copy_members(&[wit_parser::Type::U32, wit_parser::Type::U32], from, to)
+    }
+
+    /// One leaf, read at its own width from memory or a local and written at
+    /// its own width to memory or a local.
+    ///
+    /// `load` and `store` are the leaf's own, and `load.result()` is its core
+    /// type. A local may be wider, as the join of a variant's cases, so the
+    /// copy converts a value from a local to the core type on the way in, and
+    /// from the core type to a local's type on the way out.
+    fn copy_leaf(&self, load: Load, store: Store, from: &Slot, to: &Slot) -> Result<()> {
+        let core = load.result();
+        // A store takes its address first.
+        if let Slot::Memory { base, .. } = to {
+            self.emit(Instruction::LocalGet(*base));
+        }
+        match from {
+            Slot::Memory { base, offset } => {
+                self.emit(Instruction::LocalGet(*base));
+                self.emit(load.instruction(*offset));
+            }
+            Slot::Flat { locals } => {
+                let Some(local) = locals.first() else {
+                    bail!("a leaf needs a local, got none");
+                };
+                self.emit(Instruction::LocalGet(local.index));
+                for instruction in bitcast(local.ty, core)? {
+                    self.emit(instruction);
+                }
+            }
+        }
+        match to {
+            Slot::Memory { offset, .. } => {
+                self.emit(store.instruction(*offset));
+                Ok(())
+            }
+            Slot::Flat { locals } => {
+                let Some(local) = locals.first() else {
+                    bail!("a leaf needs a local, got none");
+                };
+                self.set_local(*local, core)
+            }
+        }
+    }
+
+    /// A variant-like: its discriminant, then the payload of whichever case
+    /// the discriminant names, each between its slots on either side.
+    fn copy_variant(
+        &self,
+        cases: &[Option<wit_parser::Type>],
+        tag: Int,
+        from: &Slot,
+        to: &Slot,
+    ) -> Result<()> {
+        let (load, store) = (Load::for_tag(tag), Store::for_tag(tag));
+        // Read once into a local of its own, which every case then tests.
+        let disc = Local::new(self.emitter.local(load.result()), load.result());
+        let disc_slot = Slot::flat(vec![disc]);
+        self.copy_leaf(load, store, &from.member(0, 0, 1), &disc_slot)?;
+        self.copy_leaf(load, store, &disc_slot, &to.member(0, 0, 1))?;
+
+        let payload_offset = self
+            .ctx
+            .layout()
+            .payload_offset(tag, cases.iter().map(|case| case.as_ref()));
+        let (from_payload, to_payload) = (from.payload(payload_offset), to.payload(payload_offset));
+        for (index, case) in cases.iter().enumerate() {
+            let Some(ty) = case else { continue };
+            self.emit(Instruction::LocalGet(disc.index));
+            self.emit(Instruction::I32Const(index as i32));
+            self.emit(Instruction::I32Eq);
+            self.emitter.if_(BlockType::Empty, || {
+                self.copy_walk(*ty, &from_payload, &to_payload)
+            })?;
+        }
+        Ok(())
     }
 
     /// Write a flags value whose set bits are known while emitting.
@@ -1423,7 +1351,7 @@ impl<'a> Writer<'a> {
     /// 1-byte value would run past it.
     fn write_flag_bits(&self, count: usize, bits: &ValueRef, slot: &Slot) -> Result<()> {
         let source = Local::new(self.emitter.local(ValType::I32), ValType::I32);
-        self.copy_flat_from(bits, &[source])?;
+        self.copy(bits, bits.ty, &Slot::flat(vec![source]))?;
         if let Slot::Flat { locals } = slot {
             let Some(local) = locals.first() else {
                 bail!("flags need a local, got none");
@@ -1432,41 +1360,6 @@ impl<'a> Writer<'a> {
         }
         let (base, offset) = self.memory_dest(slot)?;
         self.store_local(base, offset, flag_width(count), source)
-    }
-
-    /// Copy a materialized value into locals.
-    ///
-    /// The destination may be wider than the source: copying into a variant's
-    /// payload means the locals are the join of every case, so a narrow one
-    /// fills the leading slots and the rest stay zero; nothing reads past the
-    /// case's own width. Hence `>`, not `!=`.
-    fn copy_flat_from(&self, source: &ValueRef, dest_locals: &[Local]) -> Result<()> {
-        let flats = abi::flat_types(self.ctx.resolve(), source.ty)?;
-        if flats.len() > dest_locals.len() {
-            bail!(
-                "source flattens to {} core values but the destination has only {} locals",
-                flats.len(),
-                dest_locals.len()
-            );
-        }
-        match &source.slot {
-            Slot::Flat { locals } => {
-                for (dest, source_local) in dest_locals.iter().zip(locals) {
-                    self.set_local_from(*dest, *source_local)?;
-                }
-                Ok(())
-            }
-            Slot::Memory { base, offset } => {
-                let mut cursor = *offset;
-                for (dest, flat) in dest_locals.iter().zip(&flats) {
-                    self.emit(Instruction::LocalGet(*base));
-                    self.emit(Load::for_type(*flat)?.instruction(cursor));
-                    self.set_local(*dest, *flat)?;
-                    cursor += flat_width(*flat)?;
-                }
-                Ok(())
-            }
-        }
     }
 
     /// Write a `{ptr, len}` pair, the ABI form of `list`/`map`/`string`.
@@ -1527,17 +1420,10 @@ impl<'a> Writer<'a> {
                 // A discriminant is a small non-negative integer, so it is an
                 // i32 on the stack; the local may be wider from a join.
                 self.set_local_const(disc_local, disc as i32)?;
-                Ok(Slot::flat(locals[1..].to_vec()))
             }
-            Slot::Memory { base, offset } => {
-                let (base, offset) = (*base, *offset);
-                self.store_disc(base, offset, tag, disc)?;
-                Ok(Slot::Memory {
-                    base,
-                    offset: offset + payload_offset,
-                })
-            }
+            Slot::Memory { base, offset } => self.store_disc(*base, *offset, tag, disc)?,
         }
+        Ok(slot.payload(payload_offset))
     }
 
     /// Store an i32 constant at `base + offset`.
@@ -1710,7 +1596,11 @@ pub(crate) fn reserve_memory(ctx: &BuildContext, emitter: &Emitter, ty: wit_pars
 
 /// Per-member slots for a record-like sequence. [`Slot::member`] takes
 /// whatever the parent needs, so one computation serves either a memory or
-/// flat destination. Used by both the read and write walks.
+/// flat destination. The read, write, and copy walks all use it.
+///
+/// Members' flat widths matter only for a parent in locals. A parent in
+/// memory needs byte offsets alone, and may hold a member too wide to
+/// flatten at all.
 pub(crate) fn member_slots(
     ctx: &BuildContext,
     parent: &Slot,
@@ -1720,7 +1610,10 @@ pub(crate) fn member_slots(
     let mut slots = Vec::with_capacity(types.len());
     let mut cursor = 0usize;
     for (ty, offset) in types.iter().zip(offsets) {
-        let width = abi::flat_types(ctx.resolve(), *ty)?.len();
+        let width = match parent {
+            Slot::Flat { .. } => abi::flat_types(ctx.resolve(), *ty)?.len(),
+            Slot::Memory { .. } => 0,
+        };
         slots.push(parent.member(offset, cursor, cursor + width));
         cursor += width;
     }
@@ -1754,7 +1647,20 @@ fn follow_aliases(resolve: &Resolve, ty: wit_parser::Type) -> wit_parser::Type {
 /// Whether `a` and `b` are the same type under the component model's type
 /// equality: structural, with aliases resolved and type names ignored. Only a
 /// handle's resource is compared by identity.
-fn types_equal(resolve: &Resolve, a: wit_parser::Type, b: wit_parser::Type) -> bool {
+pub(crate) fn types_equal(resolve: &Resolve, a: wit_parser::Type, b: wit_parser::Type) -> bool {
+    types_match(resolve, a, b, false)
+}
+
+/// Whether a value of type `arg` can be passed where `param` is expected:
+/// the same type, or one that owns a resource handle where `param` borrows
+/// it, which lends the handle for the call (`lift_borrow` accepts either).
+pub(crate) fn can_pass(resolve: &Resolve, arg: wit_parser::Type, param: wit_parser::Type) -> bool {
+    types_match(resolve, arg, param, true)
+}
+
+/// [`types_equal`], or [`can_pass`] when `lend` allows an `own` in `a` where
+/// `b` has a `borrow` of the same resource.
+fn types_match(resolve: &Resolve, a: wit_parser::Type, b: wit_parser::Type, lend: bool) -> bool {
     let (a, b) = (follow_aliases(resolve, a), follow_aliases(resolve, b));
     let (wit_parser::Type::Id(a), wit_parser::Type::Id(b)) = (a, b) else {
         return a == b;
@@ -1762,7 +1668,7 @@ fn types_equal(resolve: &Resolve, a: wit_parser::Type, b: wit_parser::Type) -> b
     if a == b {
         return true;
     }
-    let equal = |a, b| types_equal(resolve, a, b);
+    let equal = |a, b| types_match(resolve, a, b, lend);
     let equal_optional = |a: Option<_>, b: Option<_>| match (a, b) {
         (Some(a), Some(b)) => equal(a, b),
         (None, None) => true,
@@ -1819,6 +1725,13 @@ fn types_equal(resolve: &Resolve, a: wit_parser::Type, b: wit_parser::Type) -> b
             follow_aliases(resolve, wit_parser::Type::Id(*a))
                 == follow_aliases(resolve, wit_parser::Type::Id(*b))
         }
+        (
+            TypeDefKind::Handle(wit_parser::Handle::Own(a)),
+            TypeDefKind::Handle(wit_parser::Handle::Borrow(b)),
+        ) if lend => {
+            follow_aliases(resolve, wit_parser::Type::Id(*a))
+                == follow_aliases(resolve, wit_parser::Type::Id(*b))
+        }
         _ => false,
     }
 }
@@ -1861,16 +1774,6 @@ pub(crate) fn load_ptr_len(emitter: &Emitter, slot: &Slot) -> Result<(u32, u32)>
     }
 }
 
-/// The bytes a core value occupies where flats are packed contiguously.
-/// A width that does not match the type would misalign every flat after it.
-fn flat_width(ty: ValType) -> Result<usize> {
-    Ok(match ty {
-        ValType::I32 | ValType::F32 => 4,
-        ValType::I64 | ValType::F64 => 8,
-        other => bail!("no flat width for {other:?}"),
-    })
-}
-
 /// The WIT type name a literal was authored as, for the exact-match error,
 /// which must name what the author wrote rather than what it lowers to.
 fn leaf_kind_name(leaf: &Leaf) -> &'static str {
@@ -1894,26 +1797,28 @@ fn leaf_kind_name(leaf: &Leaf) -> &'static str {
     }
 }
 
-/// Which core constant a leaf becomes, and the core type it produces.
+/// The core constant a scalar literal becomes. Its core type and its store
+/// follow from `dest`, not from the constant: callers take them from
+/// [`abi::flat_types`] and [`Store::for_leaf`].
 ///
 /// The WIT types must match exactly: a `u8` spec is only valid at a `u8`
 /// position. Neither widening nor core-type aliasing is accepted, so `s32`
 /// into a `u32` slot is an error even though both are core i32.
-fn push_scalar(leaf: &Leaf, dest: wit_parser::Type) -> Result<(Instruction<'static>, ValType)> {
+fn scalar_const(leaf: &Leaf, dest: wit_parser::Type) -> Result<Instruction<'static>> {
     use wit_parser::Type as T;
     Ok(match (leaf, dest) {
-        (Leaf::Bool(v), T::Bool) => (Instruction::I32Const(i32::from(*v)), ValType::I32),
-        (Leaf::S8(v), T::S8) => (Instruction::I32Const(*v as i32), ValType::I32),
-        (Leaf::S16(v), T::S16) => (Instruction::I32Const(*v as i32), ValType::I32),
-        (Leaf::S32(v), T::S32) => (Instruction::I32Const(*v), ValType::I32),
-        (Leaf::S64(v), T::S64) => (Instruction::I64Const(*v), ValType::I64),
-        (Leaf::U8(v), T::U8) => (Instruction::I32Const(*v as i32), ValType::I32),
-        (Leaf::U16(v), T::U16) => (Instruction::I32Const(*v as i32), ValType::I32),
-        (Leaf::U32(v), T::U32) => (Instruction::I32Const(*v as i32), ValType::I32),
-        (Leaf::U64(v), T::U64) => (Instruction::I64Const(*v as i64), ValType::I64),
-        (Leaf::F32(v), T::F32) => (Instruction::F32Const((*v).into()), ValType::F32),
-        (Leaf::F64(v), T::F64) => (Instruction::F64Const((*v).into()), ValType::F64),
-        (Leaf::Char(v), T::Char) => (Instruction::I32Const(*v as i32), ValType::I32),
+        (Leaf::Bool(v), T::Bool) => Instruction::I32Const(i32::from(*v)),
+        (Leaf::S8(v), T::S8) => Instruction::I32Const(*v as i32),
+        (Leaf::S16(v), T::S16) => Instruction::I32Const(*v as i32),
+        (Leaf::S32(v), T::S32) => Instruction::I32Const(*v),
+        (Leaf::S64(v), T::S64) => Instruction::I64Const(*v),
+        (Leaf::U8(v), T::U8) => Instruction::I32Const(*v as i32),
+        (Leaf::U16(v), T::U16) => Instruction::I32Const(*v as i32),
+        (Leaf::U32(v), T::U32) => Instruction::I32Const(*v as i32),
+        (Leaf::U64(v), T::U64) => Instruction::I64Const(*v as i64),
+        (Leaf::F32(v), T::F32) => Instruction::F32Const((*v).into()),
+        (Leaf::F64(v), T::F64) => Instruction::F64Const((*v).into()),
+        (Leaf::Char(v), T::Char) => Instruction::I32Const(*v as i32),
         (leaf, dest) => bail!(
             "a {} literal cannot be written to a {dest:?} position",
             leaf_kind_name(leaf)
@@ -1962,7 +1867,9 @@ fn flag_bits(flags: &wit_parser::Flags, set: &[String]) -> Result<u32> {
 pub(crate) enum Load {
     I32,
     I32From8,
+    I32From8Signed,
     I32From16,
+    I32From16Signed,
     I64,
     F32,
     F64,
@@ -1979,21 +1886,32 @@ impl Load {
         }
     }
 
-    /// The full-width load for a core type.
-    fn for_type(ty: ValType) -> Result<Load> {
-        Ok(match ty {
-            ValType::I32 => Load::I32,
-            ValType::I64 => Load::I64,
-            ValType::F32 => Load::F32,
-            ValType::F64 => Load::F64,
-            other => bail!("no load for {other:?}"),
+    /// The load for a primitive of this WIT type, at its width in memory and
+    /// sign-extended if it is signed, or `None` for a type that is not one
+    /// load (`string`, and any defined type).
+    fn for_leaf(ty: wit_parser::Type) -> Option<Load> {
+        use wit_parser::Type as T;
+        Some(match ty {
+            T::Bool | T::U8 => Load::I32From8,
+            T::S8 => Load::I32From8Signed,
+            T::U16 => Load::I32From16,
+            T::S16 => Load::I32From16Signed,
+            T::U32 | T::S32 | T::Char | T::ErrorContext => Load::I32,
+            T::U64 | T::S64 => Load::I64,
+            T::F32 => Load::F32,
+            T::F64 => Load::F64,
+            T::String | T::Id(_) => return None,
         })
     }
 
     /// The type this load leaves on the stack.
     fn result(self) -> ValType {
         match self {
-            Load::I32 | Load::I32From8 | Load::I32From16 => ValType::I32,
+            Load::I32
+            | Load::I32From8
+            | Load::I32From8Signed
+            | Load::I32From16
+            | Load::I32From16Signed => ValType::I32,
             Load::I64 => ValType::I64,
             Load::F32 => ValType::F32,
             Load::F64 => ValType::F64,
@@ -2009,7 +1927,9 @@ impl Load {
         match self {
             Load::I32 => Instruction::I32Load(memory(2)),
             Load::I32From8 => Instruction::I32Load8U(memory(0)),
+            Load::I32From8Signed => Instruction::I32Load8S(memory(0)),
             Load::I32From16 => Instruction::I32Load16U(memory(1)),
+            Load::I32From16Signed => Instruction::I32Load16S(memory(1)),
             Load::I64 => Instruction::I64Load(memory(3)),
             Load::F32 => Instruction::F32Load(memory(2)),
             Load::F64 => Instruction::F64Load(memory(3)),
@@ -2042,14 +1962,19 @@ impl Store {
         }
     }
 
-    /// The full-width store for a core type.
-    fn for_type(ty: ValType) -> Result<Store> {
-        Ok(match ty {
-            ValType::I32 => Store::I32,
-            ValType::I64 => Store::I64,
-            ValType::F32 => Store::F32,
-            ValType::F64 => Store::F64,
-            other => bail!("no store for {other:?}"),
+    /// The store for a primitive of this WIT type, at its width in memory, or
+    /// `None` for a type that is not one store. The counterpart of
+    /// [`Load::for_leaf`].
+    fn for_leaf(ty: wit_parser::Type) -> Option<Store> {
+        use wit_parser::Type as T;
+        Some(match ty {
+            T::Bool | T::U8 | T::S8 => Store::I32To8,
+            T::U16 | T::S16 => Store::I32To16,
+            T::U32 | T::S32 | T::Char | T::ErrorContext => Store::I32,
+            T::U64 | T::S64 => Store::I64,
+            T::F32 => Store::F32,
+            T::F64 => Store::F64,
+            T::String | T::Id(_) => return None,
         })
     }
 
@@ -2078,17 +2003,6 @@ impl Store {
             Store::F32 => Instruction::F32Store(memory(2)),
             Store::F64 => Instruction::F64Store(memory(3)),
         }
-    }
-}
-
-/// A zero of the given core type, for padding a variant arm narrower than the
-/// joined width.
-fn zero(ty: ValType) -> Instruction<'static> {
-    match ty {
-        ValType::I64 => Instruction::I64Const(0),
-        ValType::F32 => Instruction::F32Const(0.0.into()),
-        ValType::F64 => Instruction::F64Const(0.0.into()),
-        _ => Instruction::I32Const(0),
     }
 }
 
@@ -2152,20 +2066,11 @@ mod tests {
     }
 
     #[test]
-    fn identical_func_types_share_one_index() {
-        let ctx = context(WORLD);
-        assert_eq!(ctx.func_type(&[ValType::I32], &[]), 0);
-        assert_eq!(ctx.func_type(&[], &[ValType::I32]), 1);
-        assert_eq!(ctx.func_type(&[ValType::I32], &[]), 0);
-    }
-
-    #[test]
     fn interning_releases_its_borrow() {
         let ctx = context(WORLD);
         // Each call must leave the cell free for the next, including from
         // inside a body that is mid-emission.
         ctx.intern(b"first");
-        ctx.func_type(&[], &[]);
         ctx.intern(b"second");
         assert_eq!(ctx.intern(b"first"), (0, 5));
     }
@@ -2174,12 +2079,10 @@ mod tests {
     fn taking_the_module_state_yields_what_was_interned() {
         let ctx = context(WORLD);
         ctx.intern(b"hello");
-        ctx.func_type(&[ValType::I32], &[]);
         let (_, strings) = ctx.take_module_state();
         assert_eq!(strings.len(), 5);
         // The context is left empty, so interning again starts over.
         assert_eq!(ctx.intern(b"hello"), (0, 5));
-        assert_eq!(ctx.func_type(&[ValType::I32], &[]), 0);
     }
 
     #[test]
@@ -2280,17 +2183,37 @@ mod tests {
         assert_eq!(names, vec!["x", "y"]);
     }
 
-    /// Load the named type from a pointer, and check that the body validates
-    /// with the flats it claims to leave on the stack.
+    /// Read the named type from a pointer onto the stack, and check that the
+    /// body validates with the flats it claims to leave there.
     fn loads(wit: &str, type_name: &str) -> Vec<ValType> {
         let ctx = context(wit);
         let ty = named_type(&ctx, type_name);
         // One param: the pointer the value is read from.
         let emitter = Emitter::new(1);
-        let loader = Loader::new(&ctx, &emitter);
-        let flats = loader.load(ty, 0).expect("load");
+        let flats = read(&ctx, &emitter, ty);
         let function = emitter.encode().expect("encode");
         validate(&ctx, function, vec![ValType::I32], flats.clone());
+        flats
+    }
+
+    /// Read a `ty` at local 0 into locals and push them, as `Value::push`
+    /// does for a value in memory, returning the flats pushed.
+    fn read(ctx: &BuildContext, emitter: &Emitter, ty: wit_parser::Type) -> Vec<ValType> {
+        let flats = abi::flat_types(ctx.resolve(), ty).expect("flat types");
+        let locals: Vec<Local> = flats
+            .iter()
+            .map(|core| Local::new(emitter.local(*core), *core))
+            .collect();
+        let source = ValueRef {
+            ty,
+            slot: Slot::at(0),
+        };
+        Writer::new(ctx, emitter)
+            .copy(&source, ty, &Slot::flat(locals.clone()))
+            .expect("copy");
+        for local in &locals {
+            emitter.emit(Instruction::LocalGet(local.index));
+        }
         flats
     }
 
@@ -2426,12 +2349,42 @@ mod tests {
         );
         let ty = named_type(&ctx, "perms");
         let emitter = Emitter::new(1);
-        Loader::new(&ctx, &emitter).load(ty, 0).expect("load");
+        read(&ctx, &emitter, ty);
         let bytes = emitter.encode().expect("encode").into_raw_body();
         assert!(
             bytes.contains(&I32_LOAD8U),
             "a 3-flag bitset is a one-byte load: {bytes:02x?}"
         );
+    }
+
+    #[test]
+    fn a_value_too_wide_to_flatten_is_copied_between_memory_slots() {
+        // 65 flats is past what `flat_types` can flatten, so a copy between
+        // two memory slots must move the bytes without flattening the type.
+        let fields: Vec<String> = (0..65).map(|i| format!("m{i}: u8")).collect();
+        let ctx = context(&format!(
+            "package test:wide;
+             interface i {{ record wide {{ {} }} f: func(w: wide); }}
+             world w {{ import i; }}",
+            fields.join(", ")
+        ));
+        let wide = named_type(&ctx, "wide");
+        assert!(abi::flat_types(ctx.resolve(), wide).is_err());
+        // Two params: the source and destination pointers.
+        let emitter = Emitter::new(2);
+        let source = ValueRef {
+            ty: wide,
+            slot: Slot::at(0),
+        };
+        let writer = Writer::new(&ctx, &emitter);
+        writer
+            .copy(&source, wide, &Slot::at(1))
+            .expect("a copy to the start of a memory slot");
+        writer
+            .copy(&source, wide, &Slot::Memory { base: 1, offset: 8 })
+            .expect("a copy to a member of a memory slot");
+        let function = emitter.encode().expect("encode");
+        validate(&ctx, function, vec![ValType::I32, ValType::I32], vec![]);
     }
 
     /// Emit a write of `value` into a fresh memory area and validate the body.
@@ -3552,7 +3505,14 @@ mod tests {
           entries: func() -> list<entry>;
           own-first: func() -> first;
           own-second: func() -> second;
+          lend-first: func(f: borrow<first>);
+          lend-second: func(s: borrow<second>);
         }";
+
+    /// The type of the first param of `function` in `interface`.
+    fn param_type(resolve: &Resolve, interface: &str, function: &str) -> wit_parser::Type {
+        self::interface(resolve, interface).functions[function].params[0].ty
+    }
 
     fn equality() -> Resolve {
         let mut resolve = Resolve::new();
@@ -3618,6 +3578,30 @@ mod tests {
     }
 
     #[test]
+    fn an_owned_handle_can_be_passed_where_one_is_borrowed() {
+        let resolve = equality();
+        let own = result_type(&resolve, "a", "own-first");
+        let borrow = param_type(&resolve, "b", "lend-first");
+        assert!(can_pass(&resolve, own, borrow), "it is lent for the call");
+        assert!(!types_equal(&resolve, own, borrow), "they are not one type");
+        assert!(
+            !can_pass(&resolve, own, param_type(&resolve, "b", "lend-second")),
+            "only a handle to the same resource can be lent"
+        );
+    }
+
+    #[test]
+    fn a_borrowed_handle_cannot_be_passed_where_one_is_owned() {
+        // Passing an `own` transfers it, which a borrower cannot do.
+        let resolve = equality();
+        assert!(!can_pass(
+            &resolve,
+            param_type(&resolve, "b", "lend-first"),
+            result_type(&resolve, "a", "own-first")
+        ));
+    }
+
+    #[test]
     fn a_memory_source_is_copied_verbatim() {
         // A record has padding between its flats, so the copy must be
         // byte-for-byte rather than flat-by-flat.
@@ -3676,11 +3660,90 @@ mod tests {
     }
 
     #[test]
-    fn there_is_no_store_for_a_type_that_is_not_a_flat() {
-        // A lossy fallback would have emitted an i32 store.
-        assert!(Store::for_type(ValType::V128).is_err());
-        assert!(Load::for_type(ValType::V128).is_err());
-        assert!(flat_width(ValType::V128).is_err());
+    fn each_leaf_loads_and_stores_at_its_own_width() {
+        use Instruction as I;
+        use wit_parser::Type as T;
+        // A load or store wider than the leaf would read or write past it.
+        let instructions = |ty| match (Load::for_leaf(ty), Store::for_leaf(ty)) {
+            (Some(load), Some(store)) => (load.instruction(0), store.instruction(0)),
+            _ => panic!("{ty:?} is a leaf"),
+        };
+        // A test of whether an instruction is the expected one.
+        type Expected = fn(&I) -> bool;
+        let cases: [(T, Expected, Expected); 13] = [
+            (
+                T::Bool,
+                |i| matches!(i, I::I32Load8U(_)),
+                |i| matches!(i, I::I32Store8(_)),
+            ),
+            (
+                T::U8,
+                |i| matches!(i, I::I32Load8U(_)),
+                |i| matches!(i, I::I32Store8(_)),
+            ),
+            (
+                T::S8,
+                |i| matches!(i, I::I32Load8S(_)),
+                |i| matches!(i, I::I32Store8(_)),
+            ),
+            (
+                T::U16,
+                |i| matches!(i, I::I32Load16U(_)),
+                |i| matches!(i, I::I32Store16(_)),
+            ),
+            (
+                T::S16,
+                |i| matches!(i, I::I32Load16S(_)),
+                |i| matches!(i, I::I32Store16(_)),
+            ),
+            (
+                T::U32,
+                |i| matches!(i, I::I32Load(_)),
+                |i| matches!(i, I::I32Store(_)),
+            ),
+            (
+                T::S32,
+                |i| matches!(i, I::I32Load(_)),
+                |i| matches!(i, I::I32Store(_)),
+            ),
+            (
+                T::Char,
+                |i| matches!(i, I::I32Load(_)),
+                |i| matches!(i, I::I32Store(_)),
+            ),
+            (
+                T::ErrorContext,
+                |i| matches!(i, I::I32Load(_)),
+                |i| matches!(i, I::I32Store(_)),
+            ),
+            (
+                T::U64,
+                |i| matches!(i, I::I64Load(_)),
+                |i| matches!(i, I::I64Store(_)),
+            ),
+            (
+                T::S64,
+                |i| matches!(i, I::I64Load(_)),
+                |i| matches!(i, I::I64Store(_)),
+            ),
+            (
+                T::F32,
+                |i| matches!(i, I::F32Load(_)),
+                |i| matches!(i, I::F32Store(_)),
+            ),
+            (
+                T::F64,
+                |i| matches!(i, I::F64Load(_)),
+                |i| matches!(i, I::F64Store(_)),
+            ),
+        ];
+        for (ty, is_load, is_store) in cases {
+            let (load, store) = instructions(ty);
+            assert!(is_load(&load), "{ty:?} loads with {load:?}");
+            assert!(is_store(&store), "{ty:?} stores with {store:?}");
+        }
+        // A string is a pointer and a length, not one load or store.
+        assert!(Load::for_leaf(T::String).is_none() && Store::for_leaf(T::String).is_none());
     }
 
     /// The raw body bytes of a write into memory.

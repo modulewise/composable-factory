@@ -7,6 +7,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context as TaskContext, Poll};
 
+mod support;
+use support::block_on;
+
 use anyhow::{Context, Result};
 use composable_factory::wit::PackageSource;
 use composable_factory::world::{ExportedFunction, Imports, ValueSpec};
@@ -104,26 +107,4 @@ fn an_async_export_blocks_on_an_async_import() -> Result<()> {
     );
     assert_eq!(results[0], Val::String("from the host".to_string()));
     Ok(())
-}
-
-/// Run `future` to completion on this thread, parking it while the future is
-/// not ready.
-fn block_on<T>(future: impl Future<Output = T>) -> T {
-    struct Unpark(std::thread::Thread);
-
-    impl std::task::Wake for Unpark {
-        fn wake(self: Arc<Self>) {
-            self.0.unpark();
-        }
-    }
-
-    let waker = Arc::new(Unpark(std::thread::current())).into();
-    let mut cx = TaskContext::from_waker(&waker);
-    let mut future = std::pin::pin!(future);
-    loop {
-        if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
-            return output;
-        }
-        std::thread::park();
-    }
 }
