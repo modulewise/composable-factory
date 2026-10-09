@@ -7,12 +7,13 @@ use std::rc::Rc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use wasm_encoder::{BlockType, Instruction, ValType};
+use wit_component::WitPrinter;
 use wit_parser::{Int, Resolve, TypeDefKind, WorldItem, WorldKey};
 
 use crate::abi;
 use crate::emitter::Emitter;
 use crate::values::{
-    BuildContext, Len, Load, Loader, Local, Size, Slot, ValueRef, Writer, call_allocator,
+    BuildContext, Len, Load, Local, Size, Slot, ValueRef, Writer, call_allocator, can_pass,
     flag_width, load_ptr_len, member_slots, reserve,
 };
 
@@ -330,10 +331,19 @@ impl Value {
     /// on the stack when one ends.
     pub fn push(&self) -> Result<()> {
         match &self.slot {
-            Slot::Memory { base, offset } => {
-                // The loader addresses from a bare base so include any offset.
-                let base = self.pointer_at(*base, *offset);
-                Loader::new(&self.ty.ctx, &self.emitter).load(self.ty.wit(), base)?;
+            Slot::Memory { .. } => {
+                // Read into locals of the value's own flat types, by the same
+                // copy that moves any value between memory and locals.
+                let flats = abi::flat_types(self.ty.ctx.resolve(), self.ty.wit())?;
+                let locals: Vec<Local> = flats
+                    .into_iter()
+                    .map(|core| Local::new(self.local(core), core))
+                    .collect();
+                self.writer()
+                    .copy(&self.as_ref(), self.ty.wit(), &Slot::flat(locals.clone()))?;
+                for local in locals {
+                    self.emit(Instruction::LocalGet(local.index));
+                }
             }
             Slot::Flat { locals } => {
                 for local in locals {
@@ -392,15 +402,28 @@ impl Value {
             );
         }
         let to = self.ty.child(target);
-        // Same core representation (`s32` to `u32`, `char` to `u32`, an alias)
-        // means nothing to emit, so the value is retyped in its existing slot.
+        // Same core representation (`s8` to `s32`, `char` to `u32`, an alias)
+        // means nothing to emit, so a flat value keeps its local under the new
+        // type. A value in memory is only as wide there as its own type, so this
+        // copies it into a local first: retyping an `s8` in place as an `s32`
+        // would make later reads four bytes wide.
         let Some(instruction) = coercion(&self.ty.kind(), &to.kind())? else {
             if from_flats != to_flats {
                 bail!("coerce: conversion from {from:?} to {target:?} is not supported");
             }
-            return Ok(Value::new(to, self.slot.clone(), self.emitter.clone()));
+            let slot = match &self.slot {
+                Slot::Flat { .. } => self.slot.clone(),
+                Slot::Memory { .. } => {
+                    let core = from_flats[0];
+                    let local = Local::new(self.local(core), core);
+                    self.writer()
+                        .copy(&self.as_ref(), from, &Slot::flat(vec![local]))?;
+                    Slot::flat(vec![local])
+                }
+            };
+            return Ok(Value::new(to, slot, self.emitter.clone()));
         };
-        let core = to_flats.first().copied().unwrap_or(ValType::I32);
+        let core = to_flats[0];
         self.push()?;
         self.emit(instruction);
         let local = Local::new(self.local(core), core);
@@ -454,7 +477,7 @@ impl Value {
                 let payload = payload.map(|ty| {
                     Value::new(
                         self.ty.child(ty),
-                        self.payload_slot(payload_offset),
+                        self.slot.payload(payload_offset),
                         self.emitter.clone(),
                     )
                 });
@@ -490,7 +513,7 @@ impl Value {
         })?;
         Ok(Value::new(
             self.ty.child(payload),
-            self.payload_slot(payload_offset),
+            self.slot.payload(payload_offset),
             self.emitter.clone(),
         ))
     }
@@ -737,21 +760,6 @@ impl Value {
             Slot::flat(vec![mapped, mapped_length]),
             self.emitter.clone(),
         ))
-    }
-
-    /// Where this variant-like value's payload lives, the read-side twin of
-    /// [`Value::write_disc`]'s return.
-    ///
-    /// The payload type varies per case, so this is the slot only: each arm
-    /// pairs it with its own case's type.
-    fn payload_slot(&self, payload_offset: usize) -> Slot {
-        match &self.slot {
-            Slot::Flat { locals } => Slot::flat(locals[1..].to_vec()),
-            Slot::Memory { base, offset } => Slot::Memory {
-                base: *base,
-                offset: offset + payload_offset,
-            },
-        }
     }
 
     /// Load this variant-like value's discriminant into a local of its own,
@@ -1046,7 +1054,7 @@ impl Value {
     fn read_variant(&self, visitor: &mut dyn ReadVisitor) -> Result<()> {
         let (cases, _, payload_offset) = self.ty.variant_cases()?;
         let disc = self.load_discriminant()?;
-        let payload_slot = self.payload_slot(payload_offset);
+        let payload_slot = self.slot.payload(payload_offset);
         visitor.begin_variant()?;
         self.read_cases(disc, &payload_slot, &cases, 0, visitor)?;
         visitor.end_variant()?;
@@ -2336,8 +2344,11 @@ impl ImportedFunction {
 
     /// Call this function with `args`, returning a result if it declares one.
     ///
-    /// Each argument must flatten to what its param expects: widening and
-    /// narrowing are the caller's responsibility, through [`Value::coerce`].
+    /// Each argument must be of its param's type: the same type, an alias of
+    /// it, or one of the same structure, as the component model compares them.
+    /// A param that borrows a resource also accepts a handle the caller owns,
+    /// which the call borrows for its duration. The caller converts any other
+    /// argument, a scalar through [`Value::coerce`].
     ///
     /// An async import is called synchronously. The call will block the
     /// calling task if the result is not returned immediately. Only an async
@@ -2345,27 +2356,23 @@ impl ImportedFunction {
     /// call blocks, which depends on the import's implementation.
     pub fn call(&self, args: &[Value]) -> Result<Option<Value>> {
         let resolve = self.ctx.resolve();
-        let expected: Vec<Vec<ValType>> = self
-            .func
-            .params
-            .iter()
-            .map(|param| abi::flat_types(resolve, param.ty))
-            .collect::<Result<_>>()?;
-        if args.len() != expected.len() {
+        if args.len() != self.func.params.len() {
             bail!(
                 "call: '{}' expects {} args, got {}",
                 self.func.name,
-                expected.len(),
+                self.func.params.len(),
                 args.len()
             );
         }
-        for (index, (arg, expected)) in args.iter().zip(&expected).enumerate() {
-            let got = abi::flat_types(resolve, arg.ty().wit())?;
-            if &got != expected {
+        for (index, (arg, param)) in args.iter().zip(&self.func.params).enumerate() {
+            if !can_pass(resolve, arg.ty().wit(), param.ty) {
                 bail!(
-                    "call: '{}' arg {index} type mismatch: the value flattens to {got:?} but the \
-                     param expects {expected:?} (coerce the value to match)",
-                    self.func.name
+                    "call: '{}' arg {index} type mismatch: the value is {} but the param \
+                     '{}' is {} (convert the value to match)",
+                    self.func.name,
+                    type_label(resolve, arg.ty().wit()),
+                    param.name,
+                    type_label(resolve, param.ty),
                 );
             }
         }
@@ -2387,8 +2394,32 @@ impl ImportedFunction {
                 Ok::<u32, anyhow::Error>(base)
             })
             .transpose()?;
-        for arg in args {
-            arg.push()?;
+        // Past the flat limit, the args are passed as a pointer to a single
+        // record that holds the params in declaration order, written before
+        // anything is pushed.
+        if abi::import_takes_params_indirectly(resolve, &self.func) {
+            let types: Vec<wit_parser::Type> = self.func.params.iter().map(|p| p.ty).collect();
+            let layout = self.ctx.layout();
+            let base = self.emitter.local(ValType::I32);
+            call_allocator(
+                &self.ctx,
+                &self.emitter,
+                Size::Const(layout.record_size(types.iter())),
+            );
+            self.emitter.emit(Instruction::LocalSet(base));
+            let writer = Writer::new(&self.ctx, &self.emitter);
+            for ((arg, ty), offset) in args
+                .iter()
+                .zip(&types)
+                .zip(layout.field_offsets(types.iter()))
+            {
+                writer.copy(&arg.as_ref(), *ty, &Slot::Memory { base, offset })?;
+            }
+            self.emitter.emit(Instruction::LocalGet(base));
+        } else {
+            for arg in args {
+                arg.push()?;
+            }
         }
         if let Some(base) = retarea {
             self.emitter.emit(Instruction::LocalGet(base));
@@ -2683,9 +2714,20 @@ impl Param for ExportedFunctionParam {
 impl ExportedFunctionParam {
     /// The argument value passed from a caller. Nothing is emitted or
     /// allocated by calling this function, since the argument already exists
-    /// in the body's locals.
+    /// in the body's locals, or in memory when too many params to flatten.
     pub fn receive(&self) -> Result<Value> {
         let resolve = self.ctx.resolve();
+        // Past the flat limit, the only core param is a pointer to a record
+        // holding the params in declaration order, so this is a field of that.
+        if abi::export_takes_params_indirectly(resolve, &self.func) {
+            let types: Vec<wit_parser::Type> = self.func.params.iter().map(|p| p.ty).collect();
+            let offset = self.ctx.layout().field_offsets(types.iter())[self.index];
+            return Ok(Value::new(
+                <Self as Param>::ty(self),
+                Slot::Memory { base: 0, offset },
+                self.emitter.clone(),
+            ));
+        }
         let mut first = 0u32;
         for earlier in &self.func.params[..self.index] {
             first += abi::flat_types(resolve, earlier.ty)?.len() as u32;
@@ -2700,6 +2742,15 @@ impl ExportedFunctionParam {
             Slot::flat(locals),
             self.emitter.clone(),
         ))
+    }
+}
+
+/// A type as WIT source writes it, for errors.
+fn type_label(resolve: &Resolve, ty: wit_parser::Type) -> String {
+    let mut printer = WitPrinter::default();
+    match printer.print_type_name(resolve, &ty) {
+        Ok(()) => format!("`{}`", printer.output),
+        Err(_) => format!("{ty:?}"),
     }
 }
 
