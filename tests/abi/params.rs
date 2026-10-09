@@ -1,7 +1,8 @@
-//! `MAX_FLAT_PARAMS` (16) as a count of separate params rather than the
-//! flats of one: an export receiving 16 and 17 `u8` params, sync and async,
-//! and an import called with 16 and 17. Past the limit, the params are one
-//! pointer to a record that includes them all as fields.
+//! The `MAX_FLAT_PARAMS` limit, 16 flat values across all of a function's
+//! params, reached with many small params instead of one wide one: exports
+//! taking 16 and 17 `u8` params, sync and async, and an import called with
+//! 16 and 17. Past the limit, the caller passes one pointer to a record
+//! holding all the params.
 
 use std::sync::{Arc, Mutex};
 

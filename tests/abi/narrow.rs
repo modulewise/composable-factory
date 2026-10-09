@@ -1,11 +1,11 @@
 //! Narrow leaf values where comparing with wasmtime cannot see a mistake.
 //!
-//! A narrow literal stored four bytes wide spills into the next field, but
-//! that field's own store then overwrites the spill, since the writer stores
-//! fields in address order. So the overrun shows only in the generated code.
-//! A narrow signed integer read without sign extension lifts to the same
-//! value, since a lift keeps only the low bits, so it shows only once the
-//! factory widens it itself.
+//! A narrow literal stored four bytes wide would spill into the next field,
+//! but that field's own store would then overwrite the spill, since the
+//! writer stores fields in address order. So such an overrun shows only in
+//! the generated code. A narrow signed integer read without sign extension
+//! would lift to the same value, since a lift keeps only the low bits, so
+//! it shows only once the factory widens it itself.
 
 use anyhow::{Context, Result};
 use composable_factory::wit::PackageSource;
