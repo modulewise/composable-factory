@@ -255,6 +255,7 @@ mod tests {
             &resolve,
             world,
             wit_component::StringEncoding::UTF8,
+            false,
         )
         .expect("embed");
         wit_component::ComponentEncoder::default()
@@ -268,7 +269,7 @@ mod tests {
     fn package_bytes() -> Vec<u8> {
         let mut resolve = Resolve::new();
         let package = resolve.push_str("empty.wit", EMPTY_WORLD).expect("parse");
-        wit_component::encode(&resolve, package).expect("encode a package")
+        wit_component::encode(&resolve, package, false).expect("encode a package")
     }
 
     #[test]

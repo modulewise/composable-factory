@@ -13,10 +13,10 @@ keywords = ["wasm", "webassembly", "wit"]
 anyhow = "1"
 indexmap = "2"
 serde_json = { version = "1", features = ["preserve_order"] }
-wasm-encoder = "0.259"
-wasmparser = "0.259"
-wit-component = "0.259"
-wit-parser = "0.259"
+wasm-encoder = "0.262"
+wasmparser = "0.262"
+wit-component = "0.262"
+wit-parser = "0.262"
 
 [dev-dependencies]
-wasmtime = "49"
+wasmtime = "50"
