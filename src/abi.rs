@@ -1469,6 +1469,8 @@ mod tests {
             &resolve,
             w,
             wit_component::StringEncoding::UTF8,
+            // Full interface names, as `component::wrap` embeds them.
+            false,
         )
         .expect("metadata");
         let component = wit_component::ComponentEncoder::default()

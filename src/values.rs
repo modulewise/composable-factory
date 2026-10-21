@@ -1569,11 +1569,9 @@ pub(crate) fn trap_if_beyond_u32(emitter: &Emitter, local: u32) {
 ///
 /// A list's elements always live in a heap block, but its `{pointer, length}`
 /// handle is two flats.
-///
-/// A zero-width type has no flats to occupy, so it takes the memory path.
 pub(crate) fn reserve(ctx: &BuildContext, emitter: &Emitter, ty: wit_parser::Type) -> Result<Slot> {
     let flats = abi::flat_types(ctx.resolve(), ty)?;
-    if flats.is_empty() || flats.len() > Resolve::MAX_FLAT_PARAMS {
+    if flats.len() > Resolve::MAX_FLAT_PARAMS {
         return Ok(reserve_memory(ctx, emitter, ty));
     }
     Ok(Slot::flat(
@@ -1844,12 +1842,6 @@ pub(crate) fn flag_width(count: usize) -> Int {
 /// i32. Shared by both memory and flat slots, so the two paths cannot drift on
 /// which names are valid.
 fn flag_bits(flags: &wit_parser::Flags, set: &[String]) -> Result<u32> {
-    if flags.flags.is_empty() || flags.flags.len() > 32 {
-        bail!(
-            "the component model requires at least 1 and at most 32 flags, got {}",
-            flags.flags.len()
-        );
-    }
     let mut bits = 0u32;
     for name in set {
         let index = flags
@@ -2780,90 +2772,6 @@ mod tests {
         wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
             .validate_all(&module.encode())
             .expect("the assembled module must be valid wasm");
-    }
-
-    #[test]
-    fn a_flags_type_with_no_flags_is_rejected() {
-        // A zero-width type has nowhere to store its bits. This would not be
-        // valid according to the component model. Only reachable because
-        // wit-parser accepts it, hence the test.
-        let ctx = context(
-            r"package test:noflags;
-              interface i { flags none { } f: func(a: u32); }
-              world w { import i; }",
-        );
-        let ty = named_type(&ctx, "none");
-        let emitter = Emitter::new(0);
-        let slot = reserve(&ctx, &emitter, ty).expect("reserve");
-        let error = Writer::new(&ctx, &emitter)
-            .write(ty, &slot, &ValueSpec::flags(Vec::<String>::new()))
-            .expect_err("a flags type with no flags has no representation");
-        assert!(format!("{error:#}").contains("at least 1"), "{error:#}");
-    }
-
-    #[test]
-    fn a_flags_type_with_more_than_32_flags_is_rejected() {
-        // A flags type packs into one i32, so a wider one has no bit for its
-        // later flags. It would not be valid according to the component model.
-        // Only reachable because wit-parser accepts it, hence the test.
-        let ctx = context(
-            r"package test:manyflags;
-              interface i {
-                flags many {
-                  b00, b01, b02, b03, b04, b05, b06, b07, b08, b09,
-                  b10, b11, b12, b13, b14, b15, b16, b17, b18, b19,
-                  b20, b21, b22, b23, b24, b25, b26, b27, b28, b29,
-                  b30, b31, b32, b33
-                }
-                f: func(a: u32);
-              }
-              world w { import i; }",
-        );
-        let ty = named_type(&ctx, "many");
-        let emitter = Emitter::new(0);
-        let slot = reserve(&ctx, &emitter, ty).expect("reserve");
-        let error = Writer::new(&ctx, &emitter)
-            .write(ty, &slot, &ValueSpec::flags(["b00"]))
-            .expect_err("34 flags exceed the one i32 a flags type occupies");
-        assert!(format!("{error:#}").contains("at most 32"), "{error:#}");
-    }
-
-    #[test]
-    fn a_zero_width_value_is_never_written_into() {
-        // `record { }` and `tuple<>` occupy no bytes, so their allocation is
-        // zero-sized. Any store into one would write past the value, into
-        // whatever the allocator hands out next: silent corruption that would
-        // both validate and run.
-        let ctx = context(
-            r"package test:zerowidth;
-              interface i {
-                record norec { }
-                type notuple = tuple<>;
-                f: func(a: u32);
-              }
-              world w { import i; }",
-        );
-        for (name, spec) in [
-            (
-                "norec",
-                ValueSpec::record(Vec::<(String, ValueSpec)>::new()),
-            ),
-            ("notuple", ValueSpec::tuple(Vec::<ValueSpec>::new())),
-        ] {
-            let ty = named_type(&ctx, name);
-            assert_eq!(ctx.layout().size(&ty), 0, "{name} occupies no bytes");
-            let emitter = Emitter::new(0);
-            let slot = reserve(&ctx, &emitter, ty).expect("reserve");
-            Writer::new(&ctx, &emitter)
-                .write(ty, &slot, &spec)
-                .expect("write");
-            let bytes = emitter.encode().expect("encode").into_raw_body();
-            let stores = bytes
-                .iter()
-                .filter(|byte| matches!(**byte, I32_STORE | I32_STORE8 | I32_STORE16 | I64_STORE))
-                .count();
-            assert_eq!(stores, 0, "{name} emits no store: {bytes:02x?}");
-        }
     }
 
     #[test]

@@ -249,6 +249,8 @@ fn wrap(mut core: Vec<u8>, resolve: &Resolve, world: WorldId) -> Result<Vec<u8>>
         resolve,
         world,
         wit_component::StringEncoding::UTF8,
+        // Full interface names, not canonical yet (update with ecosystem).
+        false,
     )
     .context("embedding the world metadata")?;
 
