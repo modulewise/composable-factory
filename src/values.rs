@@ -14,7 +14,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use wasm_encoder::{BlockType, Instruction, MemArg, ValType};
+use wasm_encoder::{BlockType, Instruction, MemArg, MemArgTarget, ValType};
 use wit_parser::{Int, Resolve, TypeDefKind, WorldId};
 
 use crate::abi::{self, ImportEntry, Layout};
@@ -1914,7 +1914,8 @@ impl Load {
         let memory = |align| MemArg {
             offset: offset as u64,
             align,
-            memory_index: 0,
+            target: MemArgTarget::Memory(0),
+            ordering: None,
         };
         match self {
             Load::I32 => Instruction::I32Load(memory(2)),
@@ -1985,7 +1986,8 @@ impl Store {
         let memory = |align| MemArg {
             offset: offset as u64,
             align,
-            memory_index: 0,
+            target: MemArgTarget::Memory(0),
+            ordering: None,
         };
         match self {
             Store::I32 => Instruction::I32Store(memory(2)),
