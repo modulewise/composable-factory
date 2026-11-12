@@ -1,0 +1,45 @@
+package composable:templated-http-client@0.1.0;
+
+/// Sends a request to a URI template expanded with typed values.
+interface client {
+    /// Only methods without a request body are allowed for now.
+    enum method {
+        get,
+        head,
+        delete,
+        options,
+    }
+
+    /// A typed value for one template variable, expanded as text.
+    variant template-value {
+        text(string),
+        signed(s64),
+        unsigned(u64),
+        float(f64),
+        boolean(bool),
+    }
+
+    /// A response with its body as a string.
+    record response {
+        status: u16,
+        headers: list<tuple<string, string>>,
+        body: string,
+    }
+
+    variant error {
+        /// The server responded with a status that is not 2xx.
+        response(response),
+        /// No usable response: a bad template, a connection failure, a
+        /// redirect limit, or a body that is not UTF-8.
+        failed(string),
+    }
+
+    /// Expand `template` with `values` (RFC 6570 simple expansion).
+    /// Send the request with `headers` and read the body.
+    request: async func(
+        method: method,
+        template: string,
+        values: map<string, template-value>,
+        headers: map<string, string>,
+    ) -> result<response, error>;
+}

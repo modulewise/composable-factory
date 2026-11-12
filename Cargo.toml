@@ -9,14 +9,26 @@ readme = "README.md"
 categories = ["wasm"]
 keywords = ["wasm", "webassembly", "wit"]
 
-[dependencies]
+[workspace]
+members = [
+    ".",
+    "crates/http-api-adapter",
+]
+resolver = "3"
+
+[workspace.dependencies]
 anyhow = "1"
+composable-factory = { path = "." }
+wit-parser = "0.263"
+
+[dependencies]
+anyhow.workspace = true
 indexmap = "2"
 serde_json = { version = "1", features = ["preserve_order"] }
 wasm-encoder = "0.263"
 wasmparser = "0.263"
 wit-component = "0.263"
-wit-parser = "0.263"
+wit-parser.workspace = true
 
 [dev-dependencies]
 wasmtime = "50"
