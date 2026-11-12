@@ -1,0 +1,8 @@
+package composable:url-api-factory@0.1.0;
+
+/// Generates a component with one typed function per configured HTTP endpoint.
+world url-api-factory {
+    import wasi:config/store@0.2.0-rc.1;
+
+    export composable:factory/factory@0.4.0;
+}

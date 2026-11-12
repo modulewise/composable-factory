@@ -1,0 +1,7 @@
+package composable:templated-http-client@0.1.0;
+
+world templated-http-client {
+    import componentized:http/client@0.1.0;
+
+    export client;
+}

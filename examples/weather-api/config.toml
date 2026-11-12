@@ -1,0 +1,142 @@
+[component.weather]
+uri = "factory:weather-api-factory"
+imports = ["templated-http-client", "json-mapper"]
+
+[component.weather-api-factory]
+uri = "./lib/url-api-factory.wasm"
+
+[component.weather-api-factory.config]
+package = "example:weather"
+interface = "weather"
+# Projections of weather.gov's GeoJSON: only the fields these functions
+# return, nested as the documents nest them. A field that may be null or
+# absent is an `option`.
+types = '''
+    record point { properties: point-properties }
+    record point-properties {
+        grid-id: string,
+        grid-x: u32,
+        grid-y: u32,
+        forecast: string,
+        forecast-hourly: string,
+        observation-stations: string,
+        relative-location: relative-location,
+        time-zone: string,
+    }
+    record relative-location { properties: place }
+    record place { city: string, state: string }
+
+    record forecast { properties: forecast-properties }
+    record forecast-properties {
+        units: string,
+        generated-at: string,
+        update-time: string,
+        periods: list<period>,
+    }
+    record period {
+        number: u32,
+        name: string,
+        start-time: string,
+        end-time: string,
+        is-daytime: bool,
+        temperature: s32,
+        temperature-unit: string,
+        temperature-trend: option<string>,
+        probability-of-precipitation: option<quantity>,
+        wind-speed: string,
+        wind-direction: string,
+        short-forecast: string,
+        detailed-forecast: string,
+    }
+    record quantity { unit-code: string, value: option<f64> }
+
+    record alerts { features: list<alert-feature> }
+    record alert-feature { properties: alert }
+    record alert {
+        id: string,
+        area-desc: string,
+        sent: string,
+        effective: string,
+        onset: option<string>,
+        expires: string,
+        ends: option<string>,
+        message-type: string,
+        category: string,
+        severity: severity,
+        certainty: certainty,
+        urgency: urgency,
+        event: string,
+        sender-name: string,
+        headline: option<string>,
+        description: string,
+        instruction: option<string>,
+        response: string,
+    }
+    enum severity { extreme, severe, moderate, minor, unknown }
+    enum certainty { observed, likely, possible, unlikely, unknown }
+    // `future` is a WIT keyword, so it is escaped.
+    enum urgency { immediate, expected, %future, past, unknown }
+
+    record observation { properties: observation-properties }
+    record observation-properties {
+        station-id: string,
+        station-name: string,
+        timestamp: string,
+        text-description: string,
+        temperature: option<quantity>,
+        dewpoint: option<quantity>,
+        relative-humidity: option<quantity>,
+        wind-direction: option<quantity>,
+        wind-speed: option<quantity>,
+        wind-gust: option<quantity>,
+        barometric-pressure: option<quantity>,
+        visibility: option<quantity>,
+        wind-chill: option<quantity>,
+        heat-index: option<quantity>,
+    }
+'''
+
+[component.weather-api-factory.config.names]
+fields = "camelCase"
+enums = "PascalCase"
+
+[component.weather-api-factory.config.headers]
+User-Agent = "composable-factory-weather-api/0.1"
+Accept = "application/geo+json"
+
+[component.weather-api-factory.config.endpoints.get-point]
+template = "GET https://api.weather.gov/points/{latitude:f64},{longitude:f64}"
+result = "point"
+
+[component.weather-api-factory.config.endpoints.get-forecast]
+template = "GET https://api.weather.gov/gridpoints/{office}/{grid-x:u32},{grid-y:u32}/forecast"
+result = "forecast"
+
+[component.weather-api-factory.config.endpoints.get-hourly-forecast]
+template = "GET https://api.weather.gov/gridpoints/{office}/{grid-x:u32},{grid-y:u32}/forecast/hourly"
+result = "forecast"
+
+[component.weather-api-factory.config.endpoints.get-alerts]
+template = "GET https://api.weather.gov/alerts/active/area/{area}"
+result = "alerts"
+
+[component.weather-api-factory.config.endpoints.get-latest-observation]
+template = "GET https://api.weather.gov/stations/{station-id}/observations/latest"
+result = "observation"
+
+[component.templated-http-client]
+uri = "./lib/templated-http-client.wasm"
+imports = ["http-client"]
+
+[component.http-client]
+uri = "./lib/http-client.wasm"
+imports = ["http", "clocks"]
+
+[component.json-mapper]
+uri = "./lib/json-mapper.wasm"
+
+[capability.http]
+type = "wasi:http"
+
+[capability.clocks]
+type = "wasi:clocks"

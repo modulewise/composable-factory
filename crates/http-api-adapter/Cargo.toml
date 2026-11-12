@@ -1,0 +1,13 @@
+[package]
+name = "http-api-adapter"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Builds a component with one typed function per configured HTTP endpoint"
+repository = "https://github.com/modulewise/composable-factory"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+composable-factory.workspace = true
+wit-parser.workspace = true

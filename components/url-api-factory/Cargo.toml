@@ -1,0 +1,15 @@
+[package]
+name = "url-api-factory"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Factory that builds a component with one typed function per configured HTTP endpoint"
+homepage = "https://github.com/modulewise/composable-factory/tree/main/components/url-api-factory"
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+http-api-adapter.workspace = true
+wit-bindgen.workspace = true
