@@ -99,24 +99,24 @@ fn each_case_is_written_and_its_payload_returned() -> Result<()> {
     Ok(())
 }
 
-/// One function returning `ty`, written as `case`.
-struct Single {
+/// Function returning `ty`, with `case` written as its result.
+struct CaseOf {
     ty: &'static str,
     case: &'static str,
 }
 
-impl ComponentBuilder for Single {
+impl ComponentBuilder for CaseOf {
     fn build_world(&self, world: &mut World) -> Result<()> {
         let wit = format!(
-            "package test:single;
-             interface single {{
-               enum color {{ red, green }}
+            "package test:case-of;
+             interface case-of {{
+               enum color {{ red, yellow }}
                get: func() -> {};
              }}
-             world single-world {{ export single; }}",
+             world case-of-world {{ export case-of; }}",
             self.ty
         );
-        world.add_exports(PackageSource::from_text(&wit)?.interface("single")?)
+        world.add_exports(PackageSource::from_text(&wit)?.interface("case-of")?)
     }
 
     fn build_function(&self, function: &ExportedFunction, _imports: &Imports) -> Result<()> {
@@ -131,20 +131,20 @@ impl ComponentBuilder for Single {
 
 #[test]
 fn an_unknown_case_fails_the_build() {
-    let error = build(&Single {
+    let error = build(&CaseOf {
         ty: "color",
-        case: "purple",
+        case: "orange",
     })
-    .expect_err("color has no purple");
+    .expect_err("color has no orange");
     assert!(
-        format!("{error:#}").contains("write_case: no case 'purple'"),
+        format!("{error:#}").contains("write_case: no case 'orange'"),
         "{error:#}"
     );
 }
 
 #[test]
 fn a_type_without_cases_fails_the_build() {
-    let error = build(&Single {
+    let error = build(&CaseOf {
         ty: "u32",
         case: "ok",
     })
