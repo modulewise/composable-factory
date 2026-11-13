@@ -10,7 +10,6 @@ use composable_factory::{ComponentBuilder, World};
 
 use crate::config::{Config, Endpoint};
 use crate::deserializer::JsonDeserializer;
-use crate::response::ResultReader;
 
 /// templated-http-client's `client` interface, which sends each request.
 const CLIENT_WIT: &str = include_str!("../wit/client.wit");
@@ -80,14 +79,16 @@ impl Builder {
         if matches!(ok.kind(), Kind::String) {
             return result.write(&ValueSpec::ok(body));
         }
-        let json = JsonDeserializer::new(
+        let mut json = JsonDeserializer::new(
             imports.interface("deserializer")?,
             body,
             self.config.names.clone(),
         )?;
-        let mut reader = ResultReader::new(json);
-        result.write_with(&mut reader)?;
-        reader.into_inner().close()
+        result
+            .write_case("ok")?
+            .context("`ok` carries the endpoint's result")?
+            .write_with(&mut json)?;
+        json.close()
     }
 
     /// Write templated-http-client's `error` into `result` as `err`, case for

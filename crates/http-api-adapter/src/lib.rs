@@ -7,7 +7,6 @@ pub mod config;
 pub mod deserializer;
 pub mod factory;
 pub mod names;
-pub mod response;
 pub mod template;
 
 pub use config::Config;
