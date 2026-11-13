@@ -388,6 +388,26 @@ impl Value {
         Ok(())
     }
 
+    /// Write `case` into this variant-like value (a variant, enum, option or
+    /// result) and return its payload to write, or `None` if the case has
+    /// none. The write counterpart of [`Value::assert_case`]: a returned
+    /// payload must then be written, such as with [`Value::write`] or
+    /// [`Value::write_with`].
+    pub fn write_case(&self, case: &str) -> Result<Option<Value>> {
+        let (cases, tag, payload_offset) = self.ty.variant_cases()?;
+        let (index, payload) = cases
+            .iter()
+            .enumerate()
+            .find(|(_, declared)| declared.name() == case)
+            .map(|(index, declared)| (index, declared.payload()))
+            .ok_or_else(|| anyhow!("write_case: no case '{case}' in this value's type"))?;
+        let payload_slot = self.write_disc(tag, index as i64, payload_offset)?;
+        // The payload is written through the returned value, but this value
+        // is the destination.
+        self.written.set(true);
+        Ok(payload.map(|payload| self.at_slot(self.ty.child(payload), payload_slot)))
+    }
+
     /// Convert this scalar to `target`, including signedness if relevant.
     pub fn coerce(&self, target: impl Into<wit_parser::Type>) -> Result<Value> {
         let target = target.into();

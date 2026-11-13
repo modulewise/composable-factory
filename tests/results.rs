@@ -42,7 +42,7 @@ impl ComponentBuilder for Results {
 }
 
 #[test]
-fn each_case_is_written_with_its_payload_or_without_one() -> Result<()> {
+fn each_case_is_written() -> Result<()> {
     let engine = Engine::default();
     let component = Component::new(&engine, build(&Results)?)?;
     let mut store = Store::new(&engine, ());
