@@ -388,11 +388,10 @@ impl Value {
         Ok(())
     }
 
-    /// Write `case` into this variant-like value (a variant, enum, option or
-    /// result) and return its payload to write, or `None` if the case has
-    /// none. The write counterpart of [`Value::assert_case`]: a returned
-    /// payload must then be written, such as with [`Value::write`] or
-    /// [`Value::write_with`].
+    /// Write `case` into this variant-like value (a variant, enum, option, or
+    /// result) and return its payload, or `None` if the case has none. Only
+    /// the case is written here. Write the returned payload next, such as with
+    /// [`Value::write`] or [`Value::write_with`].
     pub fn write_case(&self, case: &str) -> Result<Option<Value>> {
         let (cases, tag, payload_offset) = self.ty.variant_cases()?;
         let (index, payload) = cases
