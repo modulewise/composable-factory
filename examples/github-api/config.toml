@@ -7,7 +7,7 @@ uri = "oci://ghcr.io/modulewise/component/url-api-factory:0.1.0"
 
 [component.github-api-factory.config]
 package = "example:github"
-interface = "github"
+interface = "api"
 types = '''
     record repository {
         full-name: string,

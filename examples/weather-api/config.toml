@@ -7,7 +7,7 @@ uri = "oci://ghcr.io/modulewise/component/url-api-factory:0.1.0"
 
 [component.weather-api-factory.config]
 package = "example:weather"
-interface = "weather"
+interface = "api"
 # Projections of weather.gov's GeoJSON: only the fields these functions
 # return, nested as the documents nest them. A field that may be null or
 # absent is an `option`.

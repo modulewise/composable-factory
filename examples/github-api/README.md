@@ -42,7 +42,7 @@ The requests have no credentials, so they reach only public repositories.
 GitHub allows 60 such requests an hour for each IP address, and searches 10 a
 minute.
 
-The generated component exports `example:github/github` where each endpoint
+The generated component exports `example:github/api` where each endpoint
 is mapped to a function:
 
 ```wit
@@ -87,6 +87,6 @@ repositories with the most stars in the `webassembly` topic:
 Others to try:
 
 ```bash
-composable invoke config.toml -- github.github.get-repository modulewise composable-runtime
-composable invoke config.toml -- github.github.search-repositories "user:bytecodealliance" 5
+composable invoke config.toml -- github.api.get-repository modulewise composable-runtime
+composable invoke config.toml -- github.api.search-repositories "user:bytecodealliance" 5
 ```

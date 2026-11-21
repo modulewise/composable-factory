@@ -39,7 +39,7 @@ enums = "PascalCase"   # all-clear <- AllClear
 
 weather.gov requires a `User-Agent` header, which is sent with every request.
 
-The generated component exports `example:weather/weather` where each endpoint
+The generated component exports `example:weather/api` where each endpoint
 is mapped to a function, for example:
 
 ```wit
@@ -76,6 +76,6 @@ the grid point from that response (showing its first two periods), and
 The others:
 
 ```bash
-composable invoke config.toml -- weather.weather.get-hourly-forecast BOX 71 101
-composable invoke config.toml -- weather.weather.get-latest-observation KBOS
+composable invoke config.toml -- weather.api.get-hourly-forecast BOX 71 101
+composable invoke config.toml -- weather.api.get-latest-observation KBOS
 ```
