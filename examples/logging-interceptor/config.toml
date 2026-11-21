@@ -6,7 +6,7 @@ imports = ["greeter", "logger"]
 uri = "./lib/hello.wasm"
 
 [component.logger]
-uri = "./lib/wasi-logging-to-stdout.wasm"
+uri = "oci://ghcr.io/componentized/logging/to-stdout:v0.2.1"
 imports = ["wasip2"]
 
 [component.logging-greeter-factory]
@@ -15,7 +15,7 @@ imports = ["loader"]
 config.target = "/lib/hello.wasm"
 
 [component.loader]
-uri = "./lib/filesystem-loader.wasm"
+uri = "oci://ghcr.io/modulewise/component/filesystem-loader:0.4.0"
 imports = ["filesystem"]
 
 [capability.filesystem]

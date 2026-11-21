@@ -9,7 +9,7 @@ optionally a result type that is mapped from the JSON response.
 ```toml
 [component.weather-api-factory.config]
 package = "example:weather"
-interface = "weather"
+interface = "api"
 types = '''
     record forecast { properties: forecast-properties }
     record forecast-properties { periods: list<period> }
@@ -86,7 +86,7 @@ import, the `deserializer` from [json-mapper](../json-mapper).
 ```wit
 import composable:templated-http-client/client@0.1.0;
 import composable:factory/deserializer@0.4.0;
-export example:weather/weather;
+export example:weather/api;
 ```
 
 ## Configuring with Composable Runtime
@@ -99,7 +99,7 @@ imports = ["templated-http-client", "json-mapper"]
 [component.weather-api-factory]
 uri = "oci://ghcr.io/modulewise/component/url-api-factory:0.1.0"
 
-[component.url-api-factory.config]
+[component.weather-api-factory.config]
 # as shown above
 
 [component.templated-http-client]

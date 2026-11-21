@@ -7,26 +7,6 @@ endpoints, reading their JSON responses into WIT types.
 
 ## Prerequisites
 
-**Rust with the `wasm32-unknown-unknown` target**, to build the components:
-
-```bash
-rustup target add wasm32-unknown-unknown
-```
-
-**[`wasm-tools`](https://github.com/bytecodealliance/wasm-tools)**, to turn
-their core modules into components:
-
-```bash
-cargo install wasm-tools
-```
-
-**[`wkg`](https://github.com/bytecodealliance/wasm-pkg-tools)**, to pull the
-HTTP client component:
-
-```bash
-cargo install wkg
-```
-
 **[`composable`](https://github.com/modulewise/composable-runtime)**, to run
 the factory and to call the component it produces:
 
@@ -59,7 +39,7 @@ enums = "PascalCase"   # all-clear <- AllClear
 
 weather.gov requires a `User-Agent` header, which is sent with every request.
 
-The generated component exports `example:weather/weather` where each endpoint
+The generated component exports `example:weather/api` where each endpoint
 is mapped to a function, for example:
 
 ```wit
@@ -72,9 +52,9 @@ get-forecast: async func(office: string, grid-x: u32, grid-y: u32) -> result<for
 ./run.sh
 ```
 
-It builds the components, then calls three of the functions: `get-point` for
-Boston, `get-forecast` with the grid point from that response (showing its
-first two periods), and `get-alerts` for Massachusetts:
+It calls three of the functions: `get-point` for Boston, `get-forecast` with
+the grid point from that response (showing its first two periods), and
+`get-alerts` for Massachusetts:
 
 ```
 ==> Invoking the weather component:
@@ -96,6 +76,6 @@ first two periods), and `get-alerts` for Massachusetts:
 The others:
 
 ```bash
-composable invoke config.toml -- weather.weather.get-hourly-forecast BOX 71 101
-composable invoke config.toml -- weather.weather.get-latest-observation KBOS
+composable invoke config.toml -- weather.api.get-hourly-forecast BOX 71 101
+composable invoke config.toml -- weather.api.get-latest-observation KBOS
 ```

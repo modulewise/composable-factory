@@ -5,7 +5,7 @@ forwards to its imports, and logs each function call and return.
 
 ## Prerequisites
 
-**Rust with the `wasm32-unknown-unknown` target**, to build the factory and the loader:
+**Rust with the `wasm32-unknown-unknown` target**, to build the factory:
 
 ```bash
 rustup target add wasm32-unknown-unknown
@@ -18,8 +18,8 @@ components and to inspect what the factory emits:
 cargo install wasm-tools
 ```
 
-**[`wkg`](https://github.com/bytecodealliance/wasm-pkg-tools)**, to pull the target component and a
-`wasi:logging` implementation from their registries:
+**[`wkg`](https://github.com/bytecodealliance/wasm-pkg-tools)**, to pull the target component, which
+the factory reads from a local file:
 
 ```bash
 cargo install wkg
@@ -149,8 +149,9 @@ specifies a variant case. `ValueSpec` provides constructors to accommodate diffe
 ./run.sh
 ```
 
-It builds the factory, builds a filesystem loader used by the factory, pulls the `hello`
-target component and a `wasi:logging` implementation, then invokes the generated component:
+It builds the factory, pulls the `hello` target component, then invokes the generated component.
+The filesystem loader the factory uses and the `wasi:logging` implementation are pulled from
+ghcr.io when it runs:
 
 ```
 ==> Invoking the logging greeter:
