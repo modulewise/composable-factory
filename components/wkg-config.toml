@@ -1,0 +1,5 @@
+# The registries `wkg fetch` resolves the components' WIT dependencies from.
+# Run it in a component's dir with `wkg fetch --config ../wkg-config.toml`.
+[namespace_registries]
+wasi = "wasi.dev"
+componentized = "componentized.dev"

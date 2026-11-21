@@ -74,9 +74,9 @@ jobs:
       - name: Check vendored WIT is current
         working-directory: components/${{ steps.parse.outputs.name }}
         run: |
-          wkg fetch
+          wkg fetch --config ../wkg-config.toml
           if ! git diff --quiet -- wit/deps; then
-            echo "Vendored WIT is out of date. Run 'wkg fetch' and commit wit/deps." >&2
+            echo "Vendored WIT is out of date. Run 'wkg fetch --config ../wkg-config.toml' and commit wit/deps." >&2
             git diff --stat -- wit/deps >&2
             exit 1
           fi
