@@ -5,9 +5,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-./build.sh
-
-echo ""
 echo "==> Invoking the weather component:"
 echo "    get-point 42.3611 -71.0571"
 point=$(composable invoke config.toml -- weather.weather.get-point 42.3611 -71.0571)

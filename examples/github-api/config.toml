@@ -1,0 +1,91 @@
+[component.github]
+uri = "factory:github-api-factory"
+imports = ["templated-http-client", "json-mapper"]
+
+[component.github-api-factory]
+uri = "oci://ghcr.io/modulewise/component/url-api-factory:0.1.0"
+
+[component.github-api-factory.config]
+package = "example:github"
+interface = "github"
+types = '''
+    record repository {
+        full-name: string,
+        description: option<string>,
+        html-url: string,
+        homepage: option<string>,
+        language: option<string>,
+        stargazers-count: u32,
+        forks-count: u32,
+        open-issues-count: u32,
+        subscribers-count: u32,
+        topics: list<string>,
+        license: option<license>,
+        default-branch: string,
+        archived: bool,
+        created-at: string,
+        pushed-at: option<string>,
+    }
+    record license { spdx-id: option<string>, name: string }
+
+    record search-result {
+        total-count: u32,
+        incomplete-results: bool,
+        items: list<repository-summary>,
+    }
+    record repository-summary {
+        full-name: string,
+        description: option<string>,
+        html-url: string,
+        language: option<string>,
+        stargazers-count: u32,
+        forks-count: u32,
+        topics: list<string>,
+        pushed-at: option<string>,
+    }
+
+    record release {
+        tag-name: string,
+        name: option<string>,
+        html-url: string,
+        published-at: option<string>,
+        prerelease: bool,
+    }
+'''
+
+[component.github-api-factory.config.names]
+fields = "snake_case"
+
+[component.github-api-factory.config.headers]
+User-Agent = "composable-factory-github-api/0.1"
+Accept = "application/vnd.github+json"
+X-GitHub-Api-Version = "2022-11-28"
+
+[component.github-api-factory.config.endpoints.get-repository]
+template = "GET https://api.github.com/repos/{owner}/{repo}"
+result = "repository"
+
+[component.github-api-factory.config.endpoints.search-repositories]
+template = "GET https://api.github.com/search/repositories?q={query}&sort=stars&order=desc&per_page={limit:u32}"
+result = "search-result"
+
+[component.github-api-factory.config.endpoints.get-latest-release]
+template = "GET https://api.github.com/repos/{owner}/{repo}/releases/latest"
+result = "release"
+
+[component.templated-http-client]
+uri = "oci://ghcr.io/modulewise/component/templated-http-client:0.1.0"
+imports = ["http-client"]
+
+[component.http-client]
+uri = "oci://ghcr.io/componentized/http/client:0.1.0"
+imports = ["http", "clocks"]
+
+[component.json-mapper]
+uri = "oci://ghcr.io/modulewise/component/json-mapper:0.4.0"
+
+[capability.http]
+type = "wasi:http"
+
+[capability.clocks]
+type = "wasi:clocks"

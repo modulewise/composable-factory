@@ -7,26 +7,6 @@ endpoints, reading their JSON responses into WIT types.
 
 ## Prerequisites
 
-**Rust with the `wasm32-unknown-unknown` target**, to build the components:
-
-```bash
-rustup target add wasm32-unknown-unknown
-```
-
-**[`wasm-tools`](https://github.com/bytecodealliance/wasm-tools)**, to turn
-their core modules into components:
-
-```bash
-cargo install wasm-tools
-```
-
-**[`wkg`](https://github.com/bytecodealliance/wasm-pkg-tools)**, to pull the
-HTTP client component:
-
-```bash
-cargo install wkg
-```
-
 **[`composable`](https://github.com/modulewise/composable-runtime)**, to run
 the factory and to call the component it produces:
 
@@ -72,9 +52,9 @@ get-forecast: async func(office: string, grid-x: u32, grid-y: u32) -> result<for
 ./run.sh
 ```
 
-It builds the components, then calls three of the functions: `get-point` for
-Boston, `get-forecast` with the grid point from that response (showing its
-first two periods), and `get-alerts` for Massachusetts:
+It calls three of the functions: `get-point` for Boston, `get-forecast` with
+the grid point from that response (showing its first two periods), and
+`get-alerts` for Massachusetts:
 
 ```
 ==> Invoking the weather component:

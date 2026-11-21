@@ -48,9 +48,12 @@ target component's exports, forwards to them as imports, and logs each call and 
 locale, to the greeter configured for it, matching the locale exactly or as a prefix.
 - [weather-api](./examples/weather-api): uses the [url-api-factory](./components/url-api-factory)
 to generate a component with typed functions over api.weather.gov endpoints.
+- [github-api](./examples/github-api): uses the [url-api-factory](./components/url-api-factory)
+to generate a component with typed functions over public GitHub REST API endpoints for
+repositories.
 
-Each has a `run.sh` that builds the factory, generates a component with the factory, and then
-invokes the generated component.
+Each has a `run.sh` that generates a component with the factory and then invokes the generated
+component.
 
 ## License
 

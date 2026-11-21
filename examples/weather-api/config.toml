@@ -3,7 +3,7 @@ uri = "factory:weather-api-factory"
 imports = ["templated-http-client", "json-mapper"]
 
 [component.weather-api-factory]
-uri = "./lib/url-api-factory.wasm"
+uri = "oci://ghcr.io/modulewise/component/url-api-factory:0.1.0"
 
 [component.weather-api-factory.config]
 package = "example:weather"
@@ -125,15 +125,15 @@ template = "GET https://api.weather.gov/stations/{station-id}/observations/lates
 result = "observation"
 
 [component.templated-http-client]
-uri = "./lib/templated-http-client.wasm"
+uri = "oci://ghcr.io/modulewise/component/templated-http-client:0.1.0"
 imports = ["http-client"]
 
 [component.http-client]
-uri = "./lib/http-client.wasm"
+uri = "oci://ghcr.io/componentized/http/client:0.1.0"
 imports = ["http", "clocks"]
 
 [component.json-mapper]
-uri = "./lib/json-mapper.wasm"
+uri = "oci://ghcr.io/modulewise/component/json-mapper:0.4.0"
 
 [capability.http]
 type = "wasi:http"

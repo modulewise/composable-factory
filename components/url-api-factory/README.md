@@ -99,7 +99,7 @@ imports = ["templated-http-client", "json-mapper"]
 [component.weather-api-factory]
 uri = "oci://ghcr.io/modulewise/component/url-api-factory:0.1.0"
 
-[component.url-api-factory.config]
+[component.weather-api-factory.config]
 # as shown above
 
 [component.templated-http-client]
