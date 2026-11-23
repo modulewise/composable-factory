@@ -31,4 +31,4 @@ wit-component = "0.263"
 wit-parser.workspace = true
 
 [dev-dependencies]
-wasmtime = "50"
+wasmtime = "51"
